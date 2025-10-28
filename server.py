@@ -147,7 +147,7 @@ def generate_tasks_for_stage(stage_id):
             prefix = match.group(1)
             script = match.group(2)
             return f"{prefix}{resolve_script_path(script)}"
-        cmd_with_resolved_script = re.sub(r'(python\s+)([a-zA-Z0-9_.\-]+)', resolve_cmd_script, raw_cmd, 1)
+        cmd_with_resolved_script = re.sub(r'(python\s+)([a-zA-Z0-G_.\-]+)', resolve_cmd_script, raw_cmd, 1)
         def replacer(match): path = resolve_vfs(match.group(1)).rstrip(os.sep); return f'"{path}"'
         resolved_cmd = re.sub(r'"(fs://[^"]+)"', replacer, cmd_with_resolved_script)
         task_id = f"T-{uuid.uuid4().hex[:8]}"
@@ -159,7 +159,7 @@ def generate_tasks_for_stage(stage_id):
             prefix = match.group(1)
             script = match.group(2)
             return f"{prefix}{resolve_script_path(script)}"
-        resolved_template = re.sub(r'(python\s+)([a-zA-Z0-9_.\-]+)', resolve_cmd_script, cmd_template, 1)
+        resolved_template = re.sub(r'(python\s+)([a-zA-Z0-G_.\-]+)', resolve_cmd_script, cmd_template, 1)
         output_dir = resolve_vfs(spec['output_dir'])
         os.makedirs(output_dir, exist_ok=True)
         for input_vfs_path in spec['inputs']:
@@ -177,62 +177,93 @@ def check_stage_completion(stage_id):
         stage_state[stage_id] = 'SUCCEEDED'; print(f"\n[+] Stage '{stage_id}' completed successfully!\n"); return True
     return False
 
-def job_controller(dag_payload):
+# SỬA LỖI: Thêm tham số is_resumed
+def job_controller(dag_payload, is_resumed=False):
     JOB_CANCEL_EVENT.clear()
+    
     try:
-        reset_job_state(); load_dag_from_payload(dag_payload)
+        # SỬA LỖI: Dùng is_resumed thay vì kiểm tra lock
+        if not is_resumed:
+            reset_job_state()
+            load_dag_from_payload(dag_payload)
+
+        checkpoint_path = resolve_vfs(f"fs://job/{job['jobId']}/checkpoint.json")
+
         for stage_id in sorted_stages:
-            if JOB_CANCEL_EVENT.is_set(): print("[*] Job cancelled by user."); stage_state[stage_id] = 'CANCELLED'; break
+            if stage_state.get(stage_id) == 'SUCCEEDED':
+                print(f"[*] Skipping already completed stage: {stage_id}")
+                continue
+            
+            if JOB_CANCEL_EVENT.is_set():
+                print("[*] Job cancelled by user."); stage_state[stage_id] = 'CANCELLED'; break
+            
             print(f"[*] Starting stage '{stage_id}'..."); stage_state[stage_id] = 'RUNNING'
             for dep_id in stage_dependencies.get(stage_id, []):
                 while stage_state.get(dep_id) != 'SUCCEEDED':
                     if JOB_CANCEL_EVENT.is_set(): break
                     time.sleep(1)
+            
             if JOB_CANCEL_EVENT.is_set(): break
-            generate_tasks_for_stage(stage_id)
+            
+            # Chỉ sinh task nếu chưa có task nào cho stage này (quan trọng khi resume)
+            if not any(t for t in tasks_state.values() if t['stageId'] == stage_id):
+                generate_tasks_for_stage(stage_id)
+            
+            last_checkpoint_time = time.time()
+            
             while stage_state.get(stage_id) != 'SUCCEEDED':
                 if JOB_CANCEL_EVENT.is_set(): break
                 if check_stage_completion(stage_id): break
+                
                 tasks_for_stage_exist = any(t['stageId'] == stage_id for t in tasks_state.values())
                 if not tasks_for_stage_exist and not any(t['stageId'] == stage_id for t in task_queue):
-                     stage_state[stage_id] = 'SUCCEEDED'; print(f"\n[+] Stage '{stage_id}' completed (no tasks generated).\n"); break
+                    stage_state[stage_id] = 'SUCCEEDED'; print(f"\n[+] Stage '{stage_id}' completed (no tasks generated).\n"); break
+                
+                current_time = time.time()
+                if current_time - last_checkpoint_time > 10:
+                    try:
+                        checkpoint_data = {
+                            "dag_payload": job, "tasks_state": make_serializable(tasks_state), "stage_state": stage_state,
+                            "stage_outputs": stage_outputs, "task_queue": list(task_queue), "sorted_stages": sorted_stages,
+                            "stage_dependencies": stage_dependencies
+                        }
+                        with open(checkpoint_path, 'w', encoding='utf-8') as f: json.dump(checkpoint_data, f)
+                        last_checkpoint_time = current_time
+                    except Exception as e:
+                        print(f"[!!!] Failed to save checkpoint for job '{job['jobId']}': {e}")
+
                 time.sleep(1)
-        if JOB_CANCEL_EVENT.is_set(): print("[***] JOB CANCELLED! [***]")
-        else: print("[***] JOB COMPLETED SUCCESSFULLY! [***]")
-    except Exception as e: print(f"[!!!] JOB FAILED: {e}")
+
+        if not JOB_CANCEL_EVENT.is_set():
+            if os.path.exists(checkpoint_path):
+                os.remove(checkpoint_path)
+                print(f"[*] Checkpoint for job '{job['jobId']}' cleaned up.")
+            print("[***] JOB COMPLETED SUCCESSFULLY! [***]")
+        else:
+            print("[***] JOB CANCELLED! [***]")
+    
+    except Exception as e:
+        print(f"[!!!] JOB FAILED: {e}")
+    
     finally:
         if job and job.get("jobId"):
             try:
-                # Tạo thư mục để lưu trữ lịch sử
                 history_dir = resolve_vfs('fs://history/')
                 os.makedirs(history_dir, exist_ok=True)
                 history_file_path = os.path.join(history_dir, f"{job['jobId']}.json")
-
-                # Chuẩn bị dữ liệu để lưu
                 final_job_status = "COMPLETED"
-                if JOB_CANCEL_EVENT.is_set():
-                    final_job_status = "CANCELLED"
-                # (Bạn có thể thêm logic để xác định trạng thái FAILED nếu cần)
-
+                if JOB_CANCEL_EVENT.is_set(): final_job_status = "CANCELLED"
                 history_data = {
-                    "jobId": job.get("jobId"),
-                    "finalStatus": final_job_status,
+                    "jobId": job.get("jobId"), "finalStatus": final_job_status,
                     "endTime": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
-                    "sorted_stages": sorted_stages,
-                    "stage_state": stage_state,
-                    # Dùng make_serializable để loại bỏ các đối tượng không thể ghi vào JSON (như socket)
+                    "sorted_stages": sorted_stages, "stage_state": stage_state,
                     "tasks_state": make_serializable(tasks_state) 
                 }
-
-                # Ghi dữ liệu vào file JSON
                 with open(history_file_path, 'w', encoding='utf-8') as f:
                     json.dump(history_data, f, indent=4)
-                
                 print(f"[*] Job history for '{job['jobId']}' saved to {history_file_path}")
-
             except Exception as e:
                 print(f"[!!!] CRITICAL: Failed to save job history for '{job['jobId']}': {e}")
-        # --- KẾT THÚC PHẦN CODE MỚI ---
         
         if JOB_IN_PROGRESS.locked(): JOB_IN_PROGRESS.release()
         print("[*] Job lock released.")
@@ -425,7 +456,8 @@ def submit_job_api():
             dag_payload = request.json
             if not dag_payload or 'jobId' not in dag_payload:
                 JOB_IN_PROGRESS.release(); return jsonify({"status": "FAIL", "message": "Invalid DAG JSON."}), 400
-            threading.Thread(target=job_controller, args=(dag_payload,)).start()
+            # SỬA LỖI: Luôn truyền is_resumed=False (hoặc không truyền gì) cho job mới
+            threading.Thread(target=job_controller, args=(dag_payload, False)).start()
             return jsonify({"status": "OK", "message": f"Job '{dag_payload['jobId']}' accepted."})
         except Exception as e:
             JOB_IN_PROGRESS.release(); return jsonify({"status": "FAIL", "message": f"Error: {e}"}), 500
@@ -437,6 +469,41 @@ def kill_job():
     print("[!!!] Received KILL signal for the current job.")
     JOB_CANCEL_EVENT.set(); task_queue.clear()
     return jsonify({"status": "OK", "message": "Kill signal sent."})
+
+@app.route('/api/history', methods=['GET'])
+def get_history_list():
+    history_dir = resolve_vfs('fs://history/')
+    if not os.path.exists(history_dir):
+        return jsonify([])
+    jobs = []
+    try:
+        for filename in os.listdir(history_dir):
+            if filename.endswith('.json'):
+                file_path = os.path.join(history_dir, filename)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                        jobs.append({"jobId": data.get("jobId", filename.replace('.json', '')), "status": data.get("finalStatus", "UNKNOWN"), "endTime": data.get("endTime", "N/A"), "filename": filename})
+                except:
+                     jobs.append({"jobId": filename, "status": "ERROR", "endTime": "N/A", "filename": filename})
+        jobs.sort(key=lambda x: x['endTime'], reverse=True)
+        return jsonify(jobs)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/history/<job_id>', methods=['GET'])
+def get_history_detail(job_id):
+    safe_filename = secure_filename(f"{job_id}.json")
+    history_path = resolve_vfs(f'fs://history/{safe_filename}')
+    if os.path.exists(history_path):
+        try:
+            with open(history_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return jsonify(data)
+        except Exception as e:
+             return jsonify({"error": f"Failed to read history file: {e}"}), 500
+    else:
+        return jsonify({"error": "Job history not found"}), 404
 
 def run_web_server():
     class ServerThread(threading.Thread):
@@ -450,10 +517,55 @@ def run_web_server():
     server_thread = ServerThread(app, HOST, WEB_PORT)
     server_thread.start()
 
+def resume_crashed_jobs():
+    print("[*] Checking for crashed jobs to resume...")
+    job_dir = resolve_vfs('fs://job/')
+    if not os.path.exists(job_dir):
+        return
+    
+    for job_id in os.listdir(job_dir):
+        checkpoint_path = os.path.join(job_dir, job_id, 'checkpoint.json')
+        if os.path.exists(checkpoint_path):
+            print(f"[!] Found checkpoint for crashed job: {job_id}. Attempting to resume.")
+            if JOB_IN_PROGRESS.acquire(blocking=False):
+                try:
+                    with open(checkpoint_path, 'r', encoding='utf-8') as f:
+                        checkpoint_data = json.load(f)
+                    
+                    global job, tasks_state, stage_state, stage_outputs, task_queue, sorted_stages, stage_dependencies
+                    job = checkpoint_data['dag_payload']
+                    tasks_state = checkpoint_data['tasks_state']
+                    stage_state = checkpoint_data['stage_state']
+                    stage_outputs = defaultdict(list, checkpoint_data['stage_outputs'])
+                    task_queue = deque(checkpoint_data['task_queue'])
+                    sorted_stages = checkpoint_data['sorted_stages']
+                    stage_dependencies = checkpoint_data['stage_dependencies']
+
+                    for tid, tinfo in list(tasks_state.items()):
+                        if tinfo.get('status') in ['ASSIGNED', 'RUNNING']:
+                            print(f"[*] Re-queueing task {tid} from resumed job.")
+                            tinfo['status'] = 'PENDING'
+                            tinfo['workerId'] = None
+                            task_queue.appendleft({'taskId': tid, 'stageId': tinfo['stageId'], 'cmd': tinfo['cmd']})
+
+                    print(f"[*] Resuming job controller for '{job_id}'...")
+                    # SỬA LỖI: Truyền is_resumed=True
+                    threading.Thread(target=job_controller, args=(job, True)).start()
+                    return
+                except Exception as e:
+                    print(f"[!!!] CRITICAL: Failed to resume job from checkpoint {checkpoint_path}: {e}")
+                    if JOB_IN_PROGRESS.locked(): JOB_IN_PROGRESS.release()
+            else:
+                print("[!] Server is already busy. Cannot resume job at this time.")
+                break
+
 def main():
     threading.Thread(target=run_web_server, daemon=True).start()
     threading.Thread(target=monitor_workers, daemon=True).start()
     threading.Thread(target=assign_tasks, daemon=True).start()
+    
+    resume_crashed_jobs()
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind((HOST, PORT)); s.listen()
         print(f"[*] Server listening on {HOST}:{PORT}, waiting for workers and job submissions...")
