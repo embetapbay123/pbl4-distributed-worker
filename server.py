@@ -1,12 +1,12 @@
 # pbl4_demo/server.py
 import socket
 import threading
-import shutil
 import json
 import struct
 import os
 import time
 import re
+import shutil
 from collections import deque, defaultdict
 import uuid
 from flask import Flask, jsonify, request, send_from_directory
@@ -40,17 +40,11 @@ def resolve_vfs(path):
     return path
 
 def resolve_script_path(script_name):
-    """
-    Ưu tiên tìm script trong thư mục VFS.
-    Nếu không có, trả về tên script gốc (để python tự tìm trong CWD).
-    """
     vfs_script_path = f"fs://scripts/{script_name}"
     real_script_path = resolve_vfs(vfs_script_path)
-    
     if os.path.exists(real_script_path):
         print(f"[*] Found user-provided script: {real_script_path}")
         return f'"{real_script_path}"'
-    
     print(f"[*] Using local script: {script_name}")
     return script_name
 
@@ -176,7 +170,6 @@ def generate_tasks_for_stage(stage_id):
             task_queue.append({'taskId': task_id, 'stageId': stage_id, 'cmd': cmd}); tasks_state[task_id] = {'status': 'PENDING', 'stageId': stage_id, 'cmd': cmd, 'retries': 0}
             print(f"[*] Generated BoT task {task_id}")
 
-# ... (Toàn bộ các hàm còn lại của server.py giữ nguyên) ...
 def check_stage_completion(stage_id):
     tasks_in_stage = [tid for tid, t in tasks_state.items() if t.get('stageId') == stage_id]
     if not tasks_in_stage: return False
@@ -291,6 +284,7 @@ def make_serializable(data):
     if isinstance(data, dict): return {k: make_serializable(v) for k, v in data.items() if k != 'socket'}
     if isinstance(data, list): return [make_serializable(i) for i in data]
     return data
+
 @app.route('/api/job', methods=['GET'])
 def get_job_status():
     with threading.Lock():
@@ -314,39 +308,29 @@ def upload_file():
     target_folder = request.form.get('target', 'raw') 
     if target_folder not in ['raw', 'scripts']:
         return jsonify({"status": "FAIL", "message": "Invalid target folder."}), 400
-
     if 'file' not in request.files:
         return jsonify({"status": "FAIL", "message": "No file part in the request."}), 400
     file = request.files['file']
     if not file or not file.filename:
         return jsonify({"status": "FAIL", "message": "No file selected."}), 400
-
     filename = secure_filename(file.filename)
-    
     upload_vfs_path = f'fs://{target_folder}/'
     upload_folder_real = resolve_vfs(upload_vfs_path)
     os.makedirs(upload_folder_real, exist_ok=True)
-    
     file_path = os.path.join(upload_folder_real, filename)
     file.save(file_path)
-    
     print(f"[*] User uploaded {filename} to {target_folder}")
-    return jsonify({
-        "status": "OK", 
-        "message": f"File '{filename}' uploaded successfully to fs://{target_folder}/."
-    })
+    return jsonify({"status": "OK", "message": f"File '{filename}' uploaded successfully to fs://{target_folder}/."})
 
 @app.route('/api/vfs/download', methods=['GET'])
 def download_file():
     vfs_path = request.args.get('path')
     if not vfs_path:
         return "Missing 'path' parameter.", 400
-
     try:
         real_path = resolve_vfs(vfs_path)
         if not os.path.abspath(real_path).startswith(os.path.abspath(VFS_ROOT)):
              return "Access denied: Cannot download files outside the VFS root.", 403
-
         if os.path.exists(real_path) and os.path.isfile(real_path):
             directory = os.path.dirname(real_path)
             filename = os.path.basename(real_path)
@@ -355,6 +339,51 @@ def download_file():
             return "File not found.", 404
     except Exception as e:
         return f"An error occurred: {e}", 500
+
+@app.route('/api/vfs/list', methods=['GET'])
+def list_vfs_path():
+    vfs_path_str = request.args.get('path', 'fs://')
+    if not vfs_path_str.startswith('fs://'):
+        return jsonify({"error": "Invalid VFS path"}), 400
+    try:
+        real_path = resolve_vfs(vfs_path_str)
+        if not os.path.abspath(real_path).startswith(os.path.abspath(VFS_ROOT)):
+            return jsonify({"error": "Access denied"}), 403
+        if not os.path.exists(real_path) or not os.path.isdir(real_path):
+            return jsonify({"error": "Path not found or is not a directory"}), 404
+        items = []
+        for name in sorted(os.listdir(real_path)):
+            item_path = os.path.join(real_path, name)
+            is_dir = os.path.isdir(item_path)
+            items.append({"name": name, "type": "directory" if is_dir else "file", "size": os.path.getsize(item_path) if not is_dir else 0})
+        return jsonify({"path": vfs_path_str, "contents": items})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/vfs/delete', methods=['POST'])
+def delete_vfs_path():
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"status": "FAIL", "message": "Invalid or missing JSON payload."}), 400
+    vfs_path_str = data.get('path')
+    if not vfs_path_str:
+        return jsonify({"status": "FAIL", "message": "Path is required in JSON payload."}), 400
+    try:
+        real_path = resolve_vfs(vfs_path_str)
+        if not os.path.abspath(real_path).startswith(os.path.abspath(VFS_ROOT)):
+            return jsonify({"status": "FAIL", "message": "Access denied."}), 403
+        if not os.path.exists(real_path):
+            return jsonify({"status": "FAIL", "message": "File or directory not found."}), 404
+        if os.path.isdir(real_path):
+            shutil.rmtree(real_path)
+            message = f"Directory '{vfs_path_str}' deleted successfully."
+        else:
+            os.remove(real_path)
+            message = f"File '{vfs_path_str}' deleted successfully."
+        print(f"[*] Deleted VFS path: {vfs_path_str}")
+        return jsonify({"status": "OK", "message": message})
+    except Exception as e:
+        return jsonify({"status": "FAIL", "message": str(e)}), 500
 
 @app.route('/api/job/submit', methods=['POST'])
 def submit_job_api():
@@ -368,6 +397,7 @@ def submit_job_api():
         except Exception as e:
             JOB_IN_PROGRESS.release(); return jsonify({"status": "FAIL", "message": f"Error: {e}"}), 500
     else: return jsonify({"status": "FAIL", "message": "Server busy."}), 409
+
 @app.route('/api/job/kill', methods=['POST'])
 def kill_job():
     if not JOB_IN_PROGRESS.locked(): return jsonify({"status": "OK", "message": "No job is running."})
