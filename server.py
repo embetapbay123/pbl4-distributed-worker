@@ -201,6 +201,39 @@ def job_controller(dag_payload):
         else: print("[***] JOB COMPLETED SUCCESSFULLY! [***]")
     except Exception as e: print(f"[!!!] JOB FAILED: {e}")
     finally:
+        if job and job.get("jobId"):
+            try:
+                # Tạo thư mục để lưu trữ lịch sử
+                history_dir = resolve_vfs('fs://history/')
+                os.makedirs(history_dir, exist_ok=True)
+                history_file_path = os.path.join(history_dir, f"{job['jobId']}.json")
+
+                # Chuẩn bị dữ liệu để lưu
+                final_job_status = "COMPLETED"
+                if JOB_CANCEL_EVENT.is_set():
+                    final_job_status = "CANCELLED"
+                # (Bạn có thể thêm logic để xác định trạng thái FAILED nếu cần)
+
+                history_data = {
+                    "jobId": job.get("jobId"),
+                    "finalStatus": final_job_status,
+                    "endTime": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+                    "sorted_stages": sorted_stages,
+                    "stage_state": stage_state,
+                    # Dùng make_serializable để loại bỏ các đối tượng không thể ghi vào JSON (như socket)
+                    "tasks_state": make_serializable(tasks_state) 
+                }
+
+                # Ghi dữ liệu vào file JSON
+                with open(history_file_path, 'w', encoding='utf-8') as f:
+                    json.dump(history_data, f, indent=4)
+                
+                print(f"[*] Job history for '{job['jobId']}' saved to {history_file_path}")
+
+            except Exception as e:
+                print(f"[!!!] CRITICAL: Failed to save job history for '{job['jobId']}': {e}")
+        # --- KẾT THÚC PHẦN CODE MỚI ---
+        
         if JOB_IN_PROGRESS.locked(): JOB_IN_PROGRESS.release()
         print("[*] Job lock released.")
 
