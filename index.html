@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PBL4 - Control Center</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css">
+    <style>
+        :root {
+            --bg-color: #121212; --card-color: #1e1e1e; --text-color: #e0e0e0;
+            --text-muted-color: #a0a0a0; --border-color: #333; --green: #28a745;
+            --blue: #0d6efd; --yellow: #ffc107; --red: #dc3545; --gray: #6c757d;
+            --teal: #20c997; --purple: #6f42c1;
+        }
+        body { 
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; 
+            background-color: var(--bg-color); color: var(--text-color); margin: 0; padding: 24px;
+        }
+        .container { max-width: 1400px; margin: auto; display: grid; grid-template-columns: 1fr 3fr; gap: 24px; }
+        .header { grid-column: 1 / -1; text-align: center; margin-bottom: 16px; }
+        .header h1 { font-size: 2.5rem; color: white; margin: 0; }
+        .header p { color: var(--text-muted-color); font-size: 1.1rem; }
+        .sidebar { display: flex; flex-direction: column; gap: 24px; }
+        .main-content { display: flex; flex-direction: column; gap: 24px; }
+        .card { background-color: var(--card-color); padding: 20px; border-radius: 12px; border: 1px solid var(--border-color); }
+        .card-header { display: flex; align-items: center; gap: 10px; font-size: 1.2rem; font-weight: 600; margin-bottom: 16px; border-bottom: 1px solid var(--border-color); padding-bottom: 12px; }
+        .status { padding: 4px 10px; border-radius: 20px; font-weight: 500; font-size: 0.8rem; text-align: center; text-transform: uppercase; }
+        .status-succeeded { background-color: rgba(40, 167, 69, 0.2); color: #52c41a; }
+        .status-running, .status-assigned { background-color: rgba(13, 110, 253, 0.2); color: #1677ff; }
+        .status-pending { background-color: rgba(108, 117, 125, 0.2); color: #8c8c8c; }
+        .status-failed { background-color: rgba(220, 53, 69, 0.2); color: #f5222d; }
+        .status-cancelled { background-color: rgba(255, 193, 7, 0.2); color: #faad14; }
+        ul { list-style: none; padding: 0; } 
+        li { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--border-color); transition: background-color 0.2s; }
+        li:last-child { border-bottom: none; }
+        li.clickable:hover { background-color: #2a2a2a; cursor: pointer; }
+        table { width: 100%; border-collapse: collapse; } 
+        th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid var(--border-color); }
+        th { background-color: #2c2c2c; cursor: pointer; } th .fas { margin-left: 8px; color: var(--text-muted-color); }
+        td button { background-color: var(--blue); color: white; padding: 5px 10px; cursor: pointer; border: none; border-radius: 4px; }
+        textarea { width: 100%; box-sizing: border-box; height: 150px; background-color: var(--bg-color); color: var(--text-color); border: 1px solid var(--border-color); border-radius: 8px; padding: 10px; font-family: 'Courier New', monospace;}
+        .btn { padding: 10px 15px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; display: flex; align-items: center; gap: 8px; }
+        .btn-primary { background-color: var(--blue); color: white; } .btn-danger { background-color: var(--red); color: white; }
+        
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px; margin-bottom: 24px; }
+        .stat-card { background-color: var(--card-color); padding: 20px; border-radius: 12px; border: 1px solid var(--border-color); }
+        .stat-card-title { font-size: 0.9rem; color: var(--text-muted-color); margin-bottom: 8px; }
+        .stat-card-value { font-size: 2rem; font-weight: 700; }
+        #stat-job-id { grid-column: 1 / -1; }
+        #stat-succeeded .stat-card-value { color: var(--green); } #stat-running .stat-card-value { color: var(--blue); }
+        #stat-failed .stat-card-value { color: var(--red); } #stat-pending .stat-card-value { color: var(--gray); }
+
+        .toast { position: fixed; top: 20px; right: 20px; background-color: #333; color: white; padding: 15px 20px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); z-index: 1000; opacity: 0; transform: translateX(100%); transition: all 0.5s ease; }
+        .toast.show { opacity: 1; transform: translateX(0); }
+        .toast.success { border-left: 5px solid var(--green); } .toast.error { border-left: 5px solid var(--red); }
+
+        .task-controls { display: flex; gap: 10px; margin-bottom: 16px; align-items: center; }
+        .task-controls select, .task-controls input { background-color: var(--bg-color); color: var(--text-color); border: 1px solid var(--border-color); padding: 8px; border-radius: 5px; }
+
+        .modal { display: none; position: fixed; z-index: 100; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.7); }
+        .modal-content { background-color: var(--card-color); margin: 10% auto; padding: 20px; border: 1px solid var(--border-color); width: 80%; max-width: 900px; border-radius: 8px; }
+        .modal-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); padding-bottom: 10px; }
+        .modal-header h2 { margin: 0; }
+        .close { color: #aaa; font-size: 28px; font-weight: bold; cursor: pointer; }
+        #log-content { white-space: pre-wrap; background-color: var(--bg-color); padding: 15px; margin-top: 15px; border-radius: 5px; max-height: 60vh; overflow-y: auto; font-family: 'Courier New', monospace; }
+
+        @media (max-width: 992px) { .container { grid-template-columns: 1fr; } }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1><i class="fas fa-network-wired" style="color: var(--blue);"></i> PBL4 Control Center</h1>
+        <p>A Lightweight Distributed Computing Framework Dashboard</p>
+    </div>
+
+    <div id="toast-container"></div>
+    
+    <div id="logModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="log-modal-title">Task Log</h2>
+                <span class="close">&times;</span>
+            </div>
+            <pre id="log-content">Loading log...</pre>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="sidebar">
+            <div class="card">
+                <div class="card-header"><i class="fas fa-terminal"></i>Control Panel</div>
+                
+                <div style="margin-bottom: 15px;">
+                    <label for="file-upload">Upload File:</label>
+                    <input type="file" id="file-upload" style="width: 100%; margin-top: 5px;">
+                    
+                    <div style="display: flex; gap: 10px; margin-top: 5px;">
+                        <select id="upload-target" style="flex-grow: 1; background-color: var(--bg-color); color: var(--text-color); border: 1px solid var(--border-color); padding: 8px; border-radius: 5px;">
+                            <option value="raw">Upload to 'fs://raw/' (Data)</option>
+                            <option value="scripts">Upload to 'fs://scripts/' (Code)</option>
+                        </select>
+                        <button id="upload-btn" class="btn" style="background-color: var(--teal); color: white;">
+                            <i class="fas fa-upload"></i> Upload
+                        </button>
+                    </div>
+                </div>
+
+                <textarea id="dag-input" placeholder="Paste your DAG JSON here..."></textarea>
+                
+                <div style="display: flex; gap: 10px; margin-top: 10px;">
+                    <button id="submit-job-btn" class="btn btn-primary"><i class="fas fa-paper-plane"></i>Submit Job</button>
+                    <button id="kill-job-btn" class="btn btn-danger"><i class="fas fa-skull-crossbones"></i>Kill Job</button>
+                </div>
+
+                <div style="margin-top: 15px;">
+                    <button id="download-btn" class="btn" style="background-color: var(--purple); color: white; width: 100%;">
+                        <i class="fas fa-download"></i> Download Result File
+                    </button>
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-header"><i class="fas fa-server"></i>Workers</div>
+                <ul id="workers-list"></ul>
+            </div>
+            <div class="card">
+                <div class="card-header"><i class="fas fa-project-diagram"></i>Stages</div>
+                <ul id="stages-list"></ul>
+            </div>
+        </div>
+        <div class="main-content">
+            <div id="job-status-container">
+            </div>
+            <div class="card">
+                <div class="card-header"><i class="fas fa-tasks"></i>Tasks</div>
+                <div class="task-controls">
+                    <label for="status-filter">Filter by Status:</label>
+                    <select id="status-filter">
+                        <option value="all">All</option>
+                        <option value="SUCCEEDED">Succeeded</option>
+                        <option value="RUNNING">Running</option>
+                        <option value="ASSIGNED">Assigned</option>
+                        <option value="PENDING">Pending</option>
+                        <option value="FAILED">Failed</option>
+                        <option value="CANCELLED">Cancelled</option>
+                    </select>
+                </div>
+                <div style="max-height: 500px; overflow-y: auto;">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th data-sort="taskId">Task ID <i class="fas fa-sort"></i></th>
+                                <th data-sort="stageId">Stage <i class="fas fa-sort"></i></th>
+                                <th data-sort="status">Status <i class="fas fa-sort"></i></th>
+                                <th data-sort="workerId">Worker <i class="fas fa-sort"></i></th>
+                                <th data-sort="retries">Retries <i class="fas fa-sort"></i></th>
+                                <th>Logs</th>
+                            </tr>
+                        </thead>
+                        <tbody id="tasks-table-body"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const API_BASE = 'http://127.0.0.1:5000/api';
+        
+        const uiState = {
+            activeStageFilter: null,
+            taskStatusFilter: 'all',
+            tasks: [],
+            taskSort: { key: 'taskId', asc: true }
+        };
+
+        const modal = document.getElementById('logModal'),
+              modalTitle = document.getElementById('log-modal-title'),
+              logContent = document.getElementById('log-content'),
+              closeBtn = document.getElementsByClassName("close")[0];
+
+        closeBtn.onclick = () => { modal.style.display = "none"; }
+        window.onclick = (event) => { if (event.target == modal) { modal.style.display = "none"; } }
+
+        function showToast(message, type = 'success') {
+            const toastContainer = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`;
+            toast.textContent = message;
+            toastContainer.appendChild(toast);
+            setTimeout(() => { toast.classList.add('show'); }, 10);
+            setTimeout(() => {
+                toast.classList.remove('show');
+                setTimeout(() => { toast.remove(); }, 500);
+            }, 3000);
+        }
+
+        function renderStats(jobData) {
+            const container = document.getElementById('job-status-container');
+            if (jobData.status === "No job running") {
+                container.innerHTML = `<div class="card"><p>No job is currently running. Use the Control Panel to submit one.</p></div>`;
+                return;
+            }
+
+            const tasks = Object.values(jobData.tasks_state || {});
+            const succeeded = tasks.filter(t => t.status === 'SUCCEEDED').length;
+            const running = tasks.filter(t => t.status === 'RUNNING' || t.status === 'ASSIGNED').length;
+            const failed = tasks.filter(t => t.status === 'FAILED').length;
+            const totalTasks = tasks.length;
+            const progress = totalTasks > 0 ? (succeeded / totalTasks) * 100 : 0;
+
+            container.innerHTML = `
+                <div class="stats-grid">
+                    <div class="stat-card" id="stat-job-id">
+                        <div class="stat-card-title">CURRENT JOB ID</div>
+                        <div class="stat-card-value">${jobData.jobId}</div>
+                        <div style="width: 100%; background-color: #444; border-radius: 5px; height: 10px; margin-top: 10px;">
+                            <div style="height: 100%; background-color: var(--green); width: ${progress.toFixed(1)}%; border-radius: 5px;"></div>
+                        </div>
+                    </div>
+                    <div class="stat-card" id="stat-succeeded">
+                        <div class="stat-card-title">SUCCEEDED</div>
+                        <div class="stat-card-value">${succeeded}</div>
+                    </div>
+                    <div class="stat-card" id="stat-running">
+                        <div class="stat-card-title">RUNNING</div>
+                        <div class="stat-card-value">${running}</div>
+                    </div>
+                    <div class="stat-card" id="stat-failed">
+                        <div class="stat-card-title">FAILED</div>
+                        <div class="stat-card-value">${failed}</div>
+                    </div>
+                    <div class="stat-card" id="stat-pending">
+                        <div class="stat-card-title">IN QUEUE</div>
+                        <div class="stat-card-value">${jobData.task_queue_size}</div>
+                    </div>
+                </div>
+            `;
+        }
+        
+        function renderWorkers(workersData) {
+            const el = document.getElementById('workers-list');
+            el.innerHTML = '';
+            if (Object.keys(workersData).length === 0) {
+                el.innerHTML = '<li>No workers connected.</li>'; return;
+            }
+            for (const id in workersData) {
+                const w = workersData[id];
+                el.innerHTML += `<li><span><i class="fas fa-microchip" style="color: var(--teal);"></i> ${id}</span><span style="color: var(--text-muted-color);">${w.slots} slots</span></li>`;
+            }
+        }
+        
+        function renderTasks() {
+            const tbody = document.getElementById('tasks-table-body');
+            tbody.innerHTML = '';
+            let filteredTasks = uiState.tasks;
+
+            if (uiState.activeStageFilter) {
+                filteredTasks = filteredTasks.filter(t => t.stageId === uiState.activeStageFilter);
+            }
+
+            if (uiState.taskStatusFilter !== 'all') {
+                filteredTasks = filteredTasks.filter(t => t.status === uiState.taskStatusFilter);
+            }
+
+            filteredTasks.sort((a, b) => {
+                const valA = a[uiState.taskSort.key] || '';
+                const valB = b[uiState.taskSort.key] || '';
+                if (valA < valB) return uiState.taskSort.asc ? -1 : 1;
+                if (valA > valB) return uiState.taskSort.asc ? 1 : -1;
+                return 0;
+            });
+            
+            if (filteredTasks.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;">No tasks match the current filters.</td></tr>';
+                return;
+            }
+            
+            let tasksHtml = '';
+            filteredTasks.forEach(t => {
+                const logBtn = (t.status === 'SUCCEEDED' || t.status === 'FAILED') ? `<button onclick="showLog('${t.taskId}')">View</button>` : 'N/A';
+                tasksHtml += `<tr><td>${t.taskId}</td><td>${t.stageId}</td><td><span class="status status-${t.status.toLowerCase()}">${t.status}</span></td><td>${t.workerId || 'N/A'}</td><td>${t.retries}</td><td>${logBtn}</td></tr>`;
+            });
+            tbody.innerHTML = tasksHtml;
+        }
+        
+        function renderStages(jobData) {
+            const el = document.getElementById('stages-list');
+            el.innerHTML = '';
+            if (!jobData.sorted_stages) {
+                el.innerHTML = '<li>Waiting for a job...</li>';
+                return;
+            }
+            jobData.sorted_stages.forEach(id => {
+                const s = jobData.stage_state[id] || 'PENDING';
+                const activeClass = uiState.activeStageFilter === id ? 'style="background-color: #2a2a2a;"' : '';
+                el.innerHTML += `<li class="clickable" onclick="filterByStage('${id}')" ${activeClass}>
+                    <span>${id}</span>
+                    <span class="status status-${s.toLowerCase()}">${s}</span>
+                </li>`;
+            });
+        }
+        
+        function filterByStage(stageId) {
+            uiState.activeStageFilter = uiState.activeStageFilter === stageId ? null : stageId;
+            updateDashboard(true);
+        }
+
+        async function updateDashboard(renderOnly = false) {
+            try {
+                if (!renderOnly) {
+                    const [jobRes, workersRes] = await Promise.all([fetch(`${API_BASE}/job`), fetch(`${API_BASE}/workers`)]);
+                    if (!jobRes.ok || !workersRes.ok) throw new Error('Network response was not ok');
+                    const jobData = await jobRes.json();
+                    const workersData = await workersRes.json();
+                    
+                    window.currentJobData = jobData;
+                    window.currentWorkersData = workersData;
+                    uiState.tasks = Object.entries(jobData.tasks_state || {}).map(([id, t]) => ({ taskId: id, ...t }));
+                }
+
+                renderStats(window.currentJobData);
+                renderWorkers(window.currentWorkersData);
+                
+                if (window.currentJobData.status !== "No job running") {
+                    renderStages(window.currentJobData);
+                    renderTasks();
+                } else {
+                    document.getElementById('stages-list').innerHTML = '<li>Waiting for a job...</li>';
+                    document.getElementById('tasks-table-body').innerHTML = '<tr><td colspan="6" style="text-align:center;">Waiting for a job...</td></tr>';
+                }
+            } catch (error) {
+                console.error("Failed to fetch data:", error);
+                showToast("Failed to connect to the server.", "error");
+            }
+        }
+        
+        async function showLog(taskId) {
+            modalTitle.innerText = `Log for Task: ${taskId}`;
+            logContent.innerText = 'Loading log...';
+            modal.style.display = "block";
+            try {
+                const res = await fetch(`${API_BASE}/tasks/${taskId}/log`);
+                if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+                const text = await res.text();
+                logContent.innerText = text || '(Log is empty)';
+            } catch (e) {
+                logContent.innerText = `Failed to load log: ${e.message}`;
+            }
+        }
+
+        // --- Event Listeners ---
+        document.getElementById('upload-btn').onclick = async () => {
+            const fileInput = document.getElementById('file-upload');
+            const targetSelect = document.getElementById('upload-target');
+            const file = fileInput.files[0];
+            const target = targetSelect.value;
+
+            if (!file) {
+                showToast('Please select a file to upload.', 'error');
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('target', target);
+
+            try {
+                const res = await fetch(`${API_BASE}/vfs/upload`, {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await res.json();
+                showToast(data.message, res.ok ? 'success' : 'error');
+                fileInput.value = '';
+            } catch (e) {
+                showToast('An error occurred during upload.', 'error');
+            }
+        };
+
+        document.getElementById('download-btn').onclick = () => {
+            const filePath = prompt("Please enter the full VFS path of the file to download:", "fs://job/FINAL_wordcount_result.txt");
+
+            if (filePath) {
+                const downloadUrl = `${API_BASE}/vfs/download?path=${encodeURIComponent(filePath)}`;
+                window.open(downloadUrl, '_blank');
+            }
+        };
+
+        document.getElementById('submit-job-btn').onclick = async () => {
+            const dagText = document.getElementById('dag-input').value;
+            if (!dagText) { showToast('DAG JSON cannot be empty.', 'error'); return; }
+            try {
+                const dagJson = JSON.parse(dagText);
+                const res = await fetch(`${API_BASE}/job/submit`, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(dagJson) });
+                const data = await res.json();
+                showToast(data.message, res.ok ? 'success' : 'error');
+            } catch (e) {
+                showToast('Error: Invalid JSON format.', 'error');
+            }
+        };
+
+        document.getElementById('kill-job-btn').onclick = async () => {
+            if (confirm('Are you sure you want to kill the current job?')) {
+                const res = await fetch(`${API_BASE}/job/kill`, { method: 'POST' });
+                const data = await res.json();
+                showToast(data.message, 'success');
+            }
+        };
+        
+        document.getElementById('status-filter').addEventListener('change', (e) => {
+            uiState.taskStatusFilter = e.target.value;
+            renderTasks();
+        });
+
+        document.querySelectorAll('th[data-sort]').forEach(th => {
+            th.addEventListener('click', () => {
+                const key = th.getAttribute('data-sort');
+                if (uiState.taskSort.key === key) {
+                    uiState.taskSort.asc = !uiState.taskSort.asc;
+                } else {
+                    uiState.taskSort.key = key;
+                    uiState.taskSort.asc = true;
+                }
+                document.querySelectorAll('th .fas').forEach(i => i.className = 'fas fa-sort');
+                const icon = th.querySelector('.fas');
+                icon.className = uiState.taskSort.asc ? 'fas fa-sort-up' : 'fas fa-sort-down';
+                renderTasks();
+            });
+        });
+
+        updateDashboard();
+        setInterval(updateDashboard, 2500);
+    </script>
+</body>
+</html>

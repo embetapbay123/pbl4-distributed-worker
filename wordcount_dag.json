@@ -1,0 +1,42 @@
+{
+  "jobId": "wordcount-demo-001",
+  "stages": [
+    {
+      "stageId": "wc-map",
+      "type": "mapreduce",
+      "deps": [],
+      "tasksSpec": {
+        "phase": "map",
+        "mapper": "wc_map.py",
+        "inputs": [
+          "fs://raw/sample.txt"
+        ],
+        "reducers": 1000,
+        "splitPolicy": {
+          "mode": "bytes",
+          "thresholdBytes": 6400,
+          "splitSizeBytes": 12800
+        }
+      }
+    },
+    {
+      "stageId": "wc-reduce",
+      "type": "mapreduce",
+      "deps": ["wc-map"],
+      "tasksSpec": {
+        "phase": "reduce",
+        "reducer": "wc_reduce.py",
+        "partitions": 1000,
+        "manifestFrom": { "stageId": "wc-map" }
+      }
+    },
+    {
+      "stageId": "summarize",
+      "type": "single",
+      "deps": ["wc-reduce"],
+      "tasksSpec": {
+        "cmd": "python summarize.py --in_dir \"fs://job/wordcount-demo-001/wc-reduce/\" --out \"fs://job/FINAL_wordcount_result.txt\""
+      }
+    }
+  ]
+}
