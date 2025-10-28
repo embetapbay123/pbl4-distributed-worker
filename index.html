@@ -1,3 +1,4 @@
+<!-- pbl4_demo/index.html -->
 <!DOCTYPE html>
 <html lang="vi">
 <head>
@@ -42,7 +43,7 @@
         th { background-color: #2c2c2c; cursor: pointer; } th .fas { margin-left: 8px; color: var(--text-muted-color); }
         td button { background-color: var(--blue); color: white; padding: 5px 10px; cursor: pointer; border: none; border-radius: 4px; }
         textarea { width: 100%; box-sizing: border-box; height: 150px; background-color: var(--bg-color); color: var(--text-color); border: 1px solid var(--border-color); border-radius: 8px; padding: 10px; font-family: 'Courier New', monospace;}
-        .btn { padding: 10px 15px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; display: flex; align-items: center; gap: 8px; }
+        .btn { padding: 10px 15px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; display: flex; align-items: center; justify-content: center; gap: 8px; }
         .btn-primary { background-color: var(--blue); color: white; } .btn-danger { background-color: var(--red); color: white; }
         
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px; margin-bottom: 24px; }
@@ -88,6 +89,29 @@
         </div>
     </div>
 
+    <div id="fileManagerModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>File Manager</h2>
+                <span class="close" id="closeFileManager">&times;</span>
+            </div>
+            <h3 id="current-vfs-path" style="font-family: 'Courier New', monospace; color: var(--text-muted-color); font-weight: 500;"></h3>
+            <div style="max-height: 60vh; overflow-y: auto;">
+                <table style="width: 100%;">
+                    <thead>
+                        <tr>
+                            <th style="width: 50%;">Name</th>
+                            <th>Type</th>
+                            <th>Size</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="file-list-body"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
     <div class="container">
         <div class="sidebar">
             <div class="card">
@@ -96,7 +120,6 @@
                 <div style="margin-bottom: 15px;">
                     <label for="file-upload">Upload File:</label>
                     <input type="file" id="file-upload" style="width: 100%; margin-top: 5px;">
-                    
                     <div style="display: flex; gap: 10px; margin-top: 5px;">
                         <select id="upload-target" style="flex-grow: 1; background-color: var(--bg-color); color: var(--text-color); border: 1px solid var(--border-color); padding: 8px; border-radius: 5px;">
                             <option value="raw">Upload to 'fs://raw/' (Data)</option>
@@ -118,6 +141,9 @@
                 <div style="margin-top: 15px;">
                     <button id="download-btn" class="btn" style="background-color: var(--purple); color: white; width: 100%;">
                         <i class="fas fa-download"></i> Download Result File
+                    </button>
+                    <button id="manage-files-btn" class="btn" style="background-color: var(--gray); color: white; width: 100%; margin-top: 10px;">
+                        <i class="fas fa-folder-open"></i> Manage Files
                     </button>
                 </div>
             </div>
@@ -181,8 +207,20 @@
               logContent = document.getElementById('log-content'),
               closeBtn = document.getElementsByClassName("close")[0];
 
+        const fileManagerModal = document.getElementById('fileManagerModal'),
+            closeFileManagerBtn = document.getElementById('closeFileManager'),
+            fileListBody = document.getElementById('file-list-body'),
+            currentVfsPathEl = document.getElementById('current-vfs-path');
+
+        let currentVfsPath = 'fs://';
+
         closeBtn.onclick = () => { modal.style.display = "none"; }
-        window.onclick = (event) => { if (event.target == modal) { modal.style.display = "none"; } }
+        closeFileManagerBtn.onclick = () => { fileManagerModal.style.display = "none"; }
+        
+        window.onclick = (event) => { 
+            if (event.target == modal) { modal.style.display = "none"; }
+            if (event.target == fileManagerModal) { fileManagerModal.style.display = "none"; }
+        }
 
         function showToast(message, type = 'success') {
             const toastContainer = document.getElementById('toast-container');
@@ -195,6 +233,85 @@
                 toast.classList.remove('show');
                 setTimeout(() => { toast.remove(); }, 500);
             }, 3000);
+        }
+
+        async function openFileManager(vfsPath = 'fs://') {
+            currentVfsPath = vfsPath;
+            currentVfsPathEl.textContent = vfsPath;
+            fileListBody.innerHTML = '<tr><td colspan="4" style="text-align:center;">Loading...</td></tr>';
+            fileManagerModal.style.display = 'block';
+
+            try {
+                const res = await fetch(`${API_BASE}/vfs/list?path=${encodeURIComponent(vfsPath)}`);
+                if (!res.ok) {
+                    const errData = await res.json();
+                    throw new Error(errData.error || `Server error: ${res.status}`);
+                }
+                const data = await res.json();
+                renderFileList(data.contents);
+            } catch (e) {
+                fileListBody.innerHTML = `<tr><td colspan="4" style="text-align:center; color: var(--red);">${e.message}</td></tr>`;
+            }
+        }
+
+        function renderFileList(contents) {
+            fileListBody.innerHTML = '';
+
+            if (currentVfsPath !== 'fs://') {
+                const parentPath = currentVfsPath.substring(0, currentVfsPath.lastIndexOf('/', currentVfsPath.length - 2) + 1) || 'fs://';
+                fileListBody.innerHTML += `
+                    <tr style="cursor: pointer;" onclick="openFileManager('${parentPath}')">
+                        <td><i class="fas fa-level-up-alt" style="margin-right: 10px;"></i>..</td>
+                        <td>Parent Directory</td>
+                        <td></td>
+                        <td></td>
+                    </tr>
+                `;
+            }
+            
+            if (contents.length === 0 && fileListBody.innerHTML === '') {
+                fileListBody.innerHTML += '<tr><td colspan="4" style="text-align:center;">Directory is empty.</td></tr>';
+            }
+
+            contents.forEach(item => {
+                const itemFullPath = `${currentVfsPath}${item.name}${item.type === 'directory' ? '/' : ''}`;
+                const isDir = item.type === 'directory';
+                const sizeFormatted = isDir ? '' : (item.size / 1024).toFixed(2) + ' KB';
+                const icon = isDir ? 'fa-folder' : 'fa-file-alt';
+                
+                const row = `
+                    <tr ${isDir ? `style="cursor: pointer;" onclick="openFileManager('${itemFullPath}')"` : ''}>
+                        <td><i class="fas ${icon}" style="margin-right: 10px; color: ${isDir ? '#ffc107' : '#e0e0e0'};"></i>${item.name}</td>
+                        <td>${item.type}</td>
+                        <td>${sizeFormatted}</td>
+                        <td>
+                            ${!isDir ? `<button onclick="event.stopPropagation(); window.open('${API_BASE}/vfs/download?path=${encodeURIComponent(itemFullPath)}', '_blank');">Download</button>` : ''}
+                            <button class="btn-danger" style="padding: 5px 10px;" onclick="event.stopPropagation(); deleteVfsPath('${itemFullPath}');">Delete</button>
+                        </td>
+                    </tr>
+                `;
+                fileListBody.innerHTML += row;
+            });
+        }
+
+        async function deleteVfsPath(vfsPath) {
+            if (!confirm(`Are you sure you want to permanently delete '${vfsPath}'? This action cannot be undone.`)) {
+                return;
+            }
+            try {
+                const res = await fetch(`${API_BASE}/vfs/delete`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ path: vfsPath })
+                });
+                const data = await res.json();
+                showToast(data.message, res.ok ? 'success' : 'error');
+                if (res.ok) {
+                    openFileManager(currentVfsPath);
+                }
+            } catch (e) {
+                showToast(`Failed to delete: ${e.message}`, 'error');
+            }
         }
 
         function renderStats(jobData) {
@@ -352,6 +469,10 @@
         }
 
         // --- Event Listeners ---
+        document.getElementById('manage-files-btn').onclick = () => {
+            openFileManager();
+        };
+
         document.getElementById('upload-btn').onclick = async () => {
             const fileInput = document.getElementById('file-upload');
             const targetSelect = document.getElementById('upload-target');
@@ -381,7 +502,7 @@
         };
 
         document.getElementById('download-btn').onclick = () => {
-            const filePath = prompt("Please enter the full VFS path of the file to download:", "fs://job/FINAL_wordcount_result.txt");
+            const filePath = prompt("Please enter the full VFS path of the file to download (you can get this from the File Manager):", "fs://job/wordcount-demo-001/summarize/FINAL_wordcount_result.txt");
 
             if (filePath) {
                 const downloadUrl = `${API_BASE}/vfs/download?path=${encodeURIComponent(filePath)}`;
