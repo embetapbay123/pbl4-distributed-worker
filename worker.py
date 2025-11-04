@@ -1,4 +1,5 @@
 # pbl4_demo/worker.py
+#docker run --rm --name worker2 -e MASTER_HOST=host.docker.internal -e MINIO_ENDPOINT=host.docker.internal:9000 -e MINIO_ACCESS_KEY=minioadmin -e MINIO_SECRET_KEY=minioadmin pbl4-worker
 import socket
 import json
 import struct
@@ -6,14 +7,40 @@ import time
 import threading
 import subprocess
 import uuid
+import os
+import re
+import boto3
+from botocore.client import Config
+from botocore.exceptions import ClientError
 
-SERVER_HOST = '127.0.0.1'
+SERVER_HOST = os.getenv('MASTER_HOST', '127.0.0.1')
 SERVER_PORT = 65432
 WORKER_ID = f"W-{uuid.uuid4().hex[:6]}"
-SLOTS = 10 
+SLOTS = 10
 HEARTBEAT_INTERVAL = 10
+SCRIPT_CACHE_DIR = "pbl4_worker_scripts" # Thư mục cache script trên worker
 
-# --- Helper Functions ---
+# --- Khối cấu hình MinIO/S3 (Thêm vào worker) ---
+MINIO_ENDPOINT = os.getenv('MINIO_ENDPOINT', '127.0.0.1:9000')
+MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
+MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
+VFS_BUCKET = 'pbl4-vfs'
+
+s3_client = boto3.client(
+    's3',
+    endpoint_url=f'http://{MINIO_ENDPOINT}',
+    aws_access_key_id=MINIO_ACCESS_KEY,
+    aws_secret_access_key=MINIO_SECRET_KEY,
+    config=Config(signature_version='s3v4')
+)
+
+def parse_vfs_path(path):
+    """Phân tích đường dẫn 'fs://' thành (bucket, key)."""
+    if not path.startswith('fs://'):
+        raise ValueError(f"Đường dẫn VFS không hợp lệ: {path}")
+    return VFS_BUCKET, path[5:]
+
+# --- Các hàm Helper (send_message, receive_message giữ nguyên) ---
 def send_message(sock, message):
     try:
         json_message = json.dumps(message).encode('utf-8')
@@ -32,13 +59,39 @@ def receive_message(sock):
 
 def run_task(task_info, sock):
     task_id = task_info['taskId']
-    cmd = task_info['cmd']
+    original_cmd = task_info['cmd']
     
-    print(f"[*] Starting task {task_id}: {cmd}")
-    send_message(sock, {"type": "TASK_UPDATE", "taskId": task_id, "status": "RUNNING"})
+    print(f"[*] Received task {task_id}: {original_cmd}")
+    send_message(sock, {"type": "TASK_UPDATE", "taskId": task_id, "status": "PREPARING"})
 
     try:
-        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='ignore')
+        # --- LOGIC MỚI: Tải script từ MinIO ---
+        final_cmd = original_cmd
+        # Tìm kiếm đường dẫn script VFS trong câu lệnh (ví dụ: fs://scripts/wc_map.py)
+        match = re.search(r'(fs://\S+\.py)', original_cmd)
+        if match:
+            script_vfs_path = match.group(1)
+            script_filename = os.path.basename(script_vfs_path)
+            local_script_path = os.path.join(SCRIPT_CACHE_DIR, script_filename)
+
+            # Kiểm tra cache, nếu chưa có thì tải về
+            if not os.path.exists(local_script_path):
+                print(f"[*] Script '{script_filename}' not in cache. Downloading from {script_vfs_path}...")
+                try:
+                    bucket, key = parse_vfs_path(script_vfs_path)
+                    s3_client.download_file(bucket, key, local_script_path)
+                    print(f"[*] Download complete: {local_script_path}")
+                except ClientError as e:
+                    raise Exception(f"Failed to download script from S3: {e}")
+
+            # Thay thế đường dẫn VFS bằng đường dẫn local trong câu lệnh
+            final_cmd = original_cmd.replace(script_vfs_path, local_script_path)
+        # --- KẾT THÚC LOGIC MỚI ---
+
+        print(f"[*] Starting task {task_id}: {final_cmd}")
+        send_message(sock, {"type": "TASK_UPDATE", "taskId": task_id, "status": "RUNNING"})
+        
+        proc = subprocess.Popen(final_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='ignore')
         stdout, stderr = proc.communicate()
 
         if proc.returncode == 0:
@@ -67,6 +120,7 @@ def run_task(task_info, sock):
             "error": error_str, "stdout": "", "stderr": error_str
         })
 
+# ... (send_heartbeat giữ nguyên) ...
 def send_heartbeat(sock):
     while True:
         try:
@@ -77,6 +131,10 @@ def send_heartbeat(sock):
             break
 
 def main():
+    # Đảm bảo thư mục cache script tồn tại
+    os.makedirs(SCRIPT_CACHE_DIR, exist_ok=True)
+    print(f"[*] Script cache directory is '{os.path.abspath(SCRIPT_CACHE_DIR)}'")
+    
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.connect((SERVER_HOST, SERVER_PORT))

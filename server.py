@@ -9,17 +9,29 @@ import re
 import shutil
 from collections import deque, defaultdict
 import uuid
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 from werkzeug.serving import make_server
 from werkzeug.utils import secure_filename
+import boto3
+from botocore.client import Config
+from botocore.exceptions import ClientError
+import io
 
-HOST = '127.0.0.1'
+# --- Constants ---
+# HOST = '127.0.0.1'
+HOST = '0.0.0.0'
 PORT = 65432
 WEB_PORT = 5000
-VFS_ROOT = os.path.abspath('./pbl4_vfs')
 MAX_TASK_RETRIES = 3
 WORKER_TIMEOUT = 30
+
+# --- MinIO/S3 Configuration ---
+# Sử dụng biến môi trường để bảo mật và linh hoạt hơn
+MINIO_ENDPOINT = os.getenv('MINIO_ENDPOINT', '127.0.0.1:9000')
+MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
+MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
+VFS_BUCKET = 'pbl4-vfs'  # Tên bucket chung cho VFS
 
 # --- Global State Management ---
 job = {}
@@ -33,21 +45,40 @@ sorted_stages = []
 JOB_IN_PROGRESS = threading.Lock()
 JOB_CANCEL_EVENT = threading.Event()
 
+# --- S3 Client Initialization ---
+try:
+    s3_client = boto3.client(
+        's3',
+        endpoint_url=f'http://{MINIO_ENDPOINT}',
+        aws_access_key_id=MINIO_ACCESS_KEY,
+        aws_secret_access_key=MINIO_SECRET_KEY,
+        config=Config(signature_version='s3v4')
+    )
+    # Kiểm tra xem bucket có tồn tại không
+    s3_client.head_bucket(Bucket=VFS_BUCKET)
+    print(f"[*] Successfully connected to MinIO and found bucket '{VFS_BUCKET}'.")
+except Exception as e:
+    print(f"[!!!] CRITICAL: Could not connect to MinIO or find bucket '{VFS_BUCKET}'. Please check your configuration.")
+    print(f"[!!!] Error: {e}")
+    os._exit(1)
+
+
 # --- Helper Functions ---
-def resolve_vfs(path):
+def parse_vfs_path(path):
+    """Phân tích một đường dẫn 'fs://' thành (bucket, key)."""
     if path.startswith('fs://'):
-        return os.path.join(VFS_ROOT, path[5:].replace('/', os.sep))
-    return path
+        return VFS_BUCKET, path[5:]
+    return None, None # Không phải là VFS path
 
 def resolve_script_path(script_name):
-    vfs_script_path = f"fs://scripts/{script_name}"
-    real_script_path = resolve_vfs(vfs_script_path)
-    if os.path.exists(real_script_path):
-        print(f"[*] Found user-provided script: {real_script_path}")
-        return f'"{real_script_path}"'
-    print(f"[*] Using local script: {script_name}")
-    return script_name
-
+    """
+    Trả về đường dẫn VFS đầy đủ đến script.
+    Worker sẽ chịu trách nhiệm tải về và thực thi nó.
+    """
+    vfs_path = f"fs://scripts/{script_name}"
+    print(f"[*] Resolving script '{script_name}' to VFS path: {vfs_path}")
+    return vfs_path
+    
 def send_message(sock, message):
     try:
         json_message = json.dumps(message).encode('utf-8')
@@ -97,30 +128,35 @@ def generate_tasks_for_stage(stage_id):
     if stage['type'] == 'mapreduce':
         if spec['phase'] == 'map':
             num_reducers = spec['reducers']
-            map_out_dir_raw = resolve_vfs(f"fs://job/{job['jobId']}/{stage_id}/")
-            os.makedirs(map_out_dir_raw, exist_ok=True)
-            map_out_dir = map_out_dir_raw.rstrip(os.sep)
+            map_out_dir_vfs = f"fs://job/{job['jobId']}/{stage_id}/" # VFS path
             mapper_script = resolve_script_path(spec["mapper"])
-            for input_path in spec['inputs']:
-                full_path = resolve_vfs(input_path)
-                if not os.path.exists(full_path) or os.path.isdir(full_path):
-                    print(f"[!] Input file not found or is a directory: {full_path}"); continue
-                file_size = os.path.getsize(full_path)
+            for input_vfs_path in spec['inputs']:
+                bucket, key = parse_vfs_path(input_vfs_path)
+                try:
+                    head = s3_client.head_object(Bucket=bucket, Key=key)
+                    file_size = head['ContentLength']
+                except ClientError:
+                    print(f"[!] Input file not found in S3: {input_vfs_path}"); continue
+                
                 if file_size == 0: continue
                 policy = spec.get('splitPolicy', {})
                 threshold = policy.get('thresholdBytes', 128*1024*1024)
                 split_size = policy.get('splitSizeBytes', 64*1024*1024)
+                
+                # Command gửi cho worker bây giờ chứa VFS paths.
+                # Script của worker sẽ chịu trách nhiệm download/upload từ MinIO.
                 if file_size <= threshold:
                     task_id = f"T-{uuid.uuid4().hex[:8]}"
-                    cmd = f'python {mapper_script} --uri "{full_path}" --start 0 --end {file_size-1} --task_id {task_id} --out_dir "{map_out_dir}" --num_reducers {num_reducers}'
+                    cmd = f'python {mapper_script} --uri "{input_vfs_path}" --start 0 --end {file_size-1} --task_id {task_id} --out_dir "{map_out_dir_vfs}" --num_reducers {num_reducers}'
                     task_queue.append({'taskId': task_id, 'stageId': stage_id, 'cmd': cmd}); tasks_state[task_id] = {'status': 'PENDING', 'stageId': stage_id, 'cmd': cmd, 'retries': 0}
                 else:
                     num_splits = (file_size + split_size - 1) // split_size
                     for i in range(num_splits):
                         start = i * split_size; end = min((i + 1) * split_size - 1, file_size - 1)
                         task_id = f"T-{uuid.uuid4().hex[:8]}"
-                        cmd = f'python {mapper_script} --uri "{full_path}" --start {start} --end {end} --task_id {task_id} --out_dir "{map_out_dir}" --num_reducers {num_reducers}'
+                        cmd = f'python {mapper_script} --uri "{input_vfs_path}" --start {start} --end {end} --task_id {task_id} --out_dir "{map_out_dir_vfs}" --num_reducers {num_reducers}'
                         task_queue.append({'taskId': task_id, 'stageId': stage_id, 'cmd': cmd}); tasks_state[task_id] = {'status': 'PENDING', 'stageId': stage_id, 'cmd': cmd, 'retries': 0}
+
         elif spec['phase'] == 'reduce':
             num_partitions = spec['partitions']; manifest_stage = spec['manifestFrom']['stageId']
             partitions = [[] for _ in range(num_partitions)]
@@ -132,40 +168,32 @@ def generate_tasks_for_stage(stage_id):
                         if 0 <= partition_index < num_partitions: partitions[partition_index].append(map_output_file)
                     except (ValueError, IndexError): print(f"[!] Warning: Invalid partition index parsed from {map_output_file}")
                 else: print(f"[!] Warning: Could not parse partition from map output file name: {map_output_file}")
+            
             reducer_script = resolve_script_path(spec["reducer"])
             for i in range(num_partitions):
                 if not partitions[i]: continue
                 task_id = f"T-{uuid.uuid4().hex[:8]}"; inputs_str = ','.join(f'"{p}"' for p in partitions[i])
-                output_file = resolve_vfs(f"fs://job/{job['jobId']}/{stage_id}/part-{i}.txt")
-                os.makedirs(os.path.dirname(output_file), exist_ok=True)
-                cmd = f'python {reducer_script} --inputs {inputs_str} --out "{output_file}"'
+                output_vfs_path = f"fs://job/{job['jobId']}/{stage_id}/part-{i}.txt"
+                cmd = f'python {reducer_script} --inputs {inputs_str} --out "{output_vfs_path}"'
                 task_queue.append({'taskId': task_id, 'stageId': stage_id, 'cmd': cmd}); tasks_state[task_id] = {'status': 'PENDING', 'stageId': stage_id, 'cmd': cmd, 'retries': 0}
 
+    # Các stage 'single' và 'bot' cũng sử dụng VFS paths trong command
     elif stage['type'] == 'single':
         raw_cmd = spec['cmd']
-        def resolve_cmd_script(match):
-            prefix = match.group(1)
-            script = match.group(2)
-            return f"{prefix}{resolve_script_path(script)}"
-        cmd_with_resolved_script = re.sub(r'(python\s+)([a-zA-Z0-G_.\-]+)', resolve_cmd_script, raw_cmd, 1)
-        def replacer(match): path = resolve_vfs(match.group(1)).rstrip(os.sep); return f'"{path}"'
-        resolved_cmd = re.sub(r'"(fs://[^"]+)"', replacer, cmd_with_resolved_script)
+        # Thay thế các "fs://..." bằng chính nó, vì worker sẽ xử lý
+        def replacer(match): return f'"{match.group(1)}"'
+        resolved_cmd = re.sub(r'"(fs://[^"]+)"', replacer, raw_cmd)
         task_id = f"T-{uuid.uuid4().hex[:8]}"
         task_queue.append({'taskId': task_id, 'stageId': stage_id, 'cmd': resolved_cmd}); tasks_state[task_id] = {'status': 'PENDING', 'stageId': stage_id, 'cmd': resolved_cmd, 'retries': 0}
 
     elif stage['type'] == 'bot':
         cmd_template = spec['cmd_template']
-        def resolve_cmd_script(match):
-            prefix = match.group(1)
-            script = match.group(2)
-            return f"{prefix}{resolve_script_path(script)}"
-        resolved_template = re.sub(r'(python\s+)([a-zA-Z0-G_.\-]+)', resolve_cmd_script, cmd_template, 1)
-        output_dir = resolve_vfs(spec['output_dir'])
-        os.makedirs(output_dir, exist_ok=True)
+        output_dir_vfs = spec['output_dir']
         for input_vfs_path in spec['inputs']:
-            input_real_path = resolve_vfs(input_vfs_path); base_name = os.path.basename(input_real_path)
-            output_real_path = os.path.join(output_dir, base_name)
-            cmd = resolved_template.replace('{input}', f'"{input_real_path}"').replace('{output}', f'"{output_real_path}"')
+            # Lấy tên file từ VFS path để tạo output path
+            base_name = input_vfs_path.split('/')[-1]
+            output_vfs_path = f"{output_dir_vfs.rstrip('/')}/{base_name}"
+            cmd = cmd_template.replace('{input}', f'"{input_vfs_path}"').replace('{output}', f'"{output_vfs_path}"')
             task_id = f"T-{uuid.uuid4().hex[:8]}"
             task_queue.append({'taskId': task_id, 'stageId': stage_id, 'cmd': cmd}); tasks_state[task_id] = {'status': 'PENDING', 'stageId': stage_id, 'cmd': cmd, 'retries': 0}
             print(f"[*] Generated BoT task {task_id}")
@@ -177,17 +205,15 @@ def check_stage_completion(stage_id):
         stage_state[stage_id] = 'SUCCEEDED'; print(f"\n[+] Stage '{stage_id}' completed successfully!\n"); return True
     return False
 
-# SỬA LỖI: Thêm tham số is_resumed
 def job_controller(dag_payload, is_resumed=False):
     JOB_CANCEL_EVENT.clear()
     
     try:
-        # SỬA LỖI: Dùng is_resumed thay vì kiểm tra lock
         if not is_resumed:
             reset_job_state()
             load_dag_from_payload(dag_payload)
 
-        checkpoint_path = resolve_vfs(f"fs://job/{job['jobId']}/checkpoint.json")
+        checkpoint_bucket, checkpoint_key = parse_vfs_path(f"fs://job/{job['jobId']}/checkpoint.json")
 
         for stage_id in sorted_stages:
             if stage_state.get(stage_id) == 'SUCCEEDED':
@@ -205,7 +231,6 @@ def job_controller(dag_payload, is_resumed=False):
             
             if JOB_CANCEL_EVENT.is_set(): break
             
-            # Chỉ sinh task nếu chưa có task nào cho stage này (quan trọng khi resume)
             if not any(t for t in tasks_state.values() if t['stageId'] == stage_id):
                 generate_tasks_for_stage(stage_id)
             
@@ -227,17 +252,25 @@ def job_controller(dag_payload, is_resumed=False):
                             "stage_outputs": stage_outputs, "task_queue": list(task_queue), "sorted_stages": sorted_stages,
                             "stage_dependencies": stage_dependencies
                         }
-                        with open(checkpoint_path, 'w', encoding='utf-8') as f: json.dump(checkpoint_data, f)
+                        # Ghi checkpoint lên MinIO
+                        s3_client.put_object(
+                            Bucket=checkpoint_bucket, 
+                            Key=checkpoint_key, 
+                            Body=json.dumps(checkpoint_data).encode('utf-8')
+                        )
                         last_checkpoint_time = current_time
                     except Exception as e:
-                        print(f"[!!!] Failed to save checkpoint for job '{job['jobId']}': {e}")
+                        print(f"[!!!] Failed to save checkpoint to S3 for job '{job['jobId']}': {e}")
 
                 time.sleep(1)
 
         if not JOB_CANCEL_EVENT.is_set():
-            if os.path.exists(checkpoint_path):
-                os.remove(checkpoint_path)
-                print(f"[*] Checkpoint for job '{job['jobId']}' cleaned up.")
+            try:
+                # Dọn dẹp checkpoint trên MinIO
+                s3_client.delete_object(Bucket=checkpoint_bucket, Key=checkpoint_key)
+                print(f"[*] Checkpoint for job '{job['jobId']}' cleaned up from S3.")
+            except ClientError as e:
+                if e.response['Error']['Code'] != 'NoSuchKey': raise e # Bỏ qua lỗi nếu file không tồn tại
             print("[***] JOB COMPLETED SUCCESSFULLY! [***]")
         else:
             print("[***] JOB CANCELLED! [***]")
@@ -248,9 +281,6 @@ def job_controller(dag_payload, is_resumed=False):
     finally:
         if job and job.get("jobId"):
             try:
-                history_dir = resolve_vfs('fs://history/')
-                os.makedirs(history_dir, exist_ok=True)
-                history_file_path = os.path.join(history_dir, f"{job['jobId']}.json")
                 final_job_status = "COMPLETED"
                 if JOB_CANCEL_EVENT.is_set(): final_job_status = "CANCELLED"
                 history_data = {
@@ -259,15 +289,21 @@ def job_controller(dag_payload, is_resumed=False):
                     "sorted_stages": sorted_stages, "stage_state": stage_state,
                     "tasks_state": make_serializable(tasks_state) 
                 }
-                with open(history_file_path, 'w', encoding='utf-8') as f:
-                    json.dump(history_data, f, indent=4)
-                print(f"[*] Job history for '{job['jobId']}' saved to {history_file_path}")
+                # Ghi history lên MinIO
+                history_bucket, history_key = parse_vfs_path(f"fs://history/{job['jobId']}.json")
+                s3_client.put_object(
+                    Bucket=history_bucket, 
+                    Key=history_key, 
+                    Body=json.dumps(history_data, indent=4).encode('utf-8')
+                )
+                print(f"[*] Job history for '{job['jobId']}' saved to S3.")
             except Exception as e:
-                print(f"[!!!] CRITICAL: Failed to save job history for '{job['jobId']}': {e}")
+                print(f"[!!!] CRITICAL: Failed to save job history to S3 for '{job['jobId']}': {e}")
         
         if JOB_IN_PROGRESS.locked(): JOB_IN_PROGRESS.release()
         print("[*] Job lock released.")
 
+# --- Worker & Task Management ---
 def assign_tasks():
     while True:
         if not task_queue: time.sleep(0.5); continue
@@ -300,10 +336,11 @@ def handle_connection(conn, addr):
                     if task_id not in tasks_state: continue
                     tasks_state[task_id]['status'] = status; print(f"[*] Task update: {task_id} -> {status}")
                     if status in ['SUCCEEDED', 'FAILED']:
-                        log_dir = resolve_vfs(f"fs://job/{job['jobId']}/logs/")
-                        os.makedirs(log_dir, exist_ok=True)
-                        with open(os.path.join(log_dir, f"{task_id}.log"), 'w', encoding='utf-8') as f:
-                            f.write("--- STDOUT ---\n"); f.write(msg.get('stdout', '')); f.write("\n\n--- STDERR ---\n"); f.write(msg.get('stderr', ''))
+                        # Ghi log task lên MinIO
+                        log_content = "--- STDOUT ---\n" + msg.get('stdout', '') + "\n\n--- STDERR ---\n" + msg.get('stderr', '')
+                        log_bucket, log_key = parse_vfs_path(f"fs://job/{job['jobId']}/logs/{task_id}.log")
+                        s3_client.put_object(Bucket=log_bucket, Key=log_key, Body=log_content.encode('utf-8'))
+                        
                         if worker_id in workers: workers[worker_id]['slots'] += 1
                         if status == 'SUCCEEDED':
                             stage_id = tasks_state[task_id]['stageId']; stage_outputs[stage_id].extend(msg.get('outputs', []))
@@ -342,6 +379,7 @@ def monitor_workers():
                     requeue_task = {'taskId': tid, 'stageId': tinfo['stageId'], 'cmd': tinfo['cmd']}
                     task_queue.appendleft(requeue_task)
 
+# --- Flask Web Server ---
 app = Flask(__name__)
 CORS(app)
 def make_serializable(data):
@@ -354,18 +392,24 @@ def get_job_status():
     with threading.Lock():
         if not job: return jsonify({"status": "No job running"})
         return jsonify({"jobId": job.get("jobId"), "sorted_stages": sorted_stages, "stage_state": stage_state, "tasks_state": make_serializable(tasks_state), "task_queue_size": len(task_queue)})
+
 @app.route('/api/workers', methods=['GET'])
 def get_workers():
     with threading.Lock():
         return jsonify(make_serializable(workers))
+
 @app.route('/api/tasks/<task_id>/log', methods=['GET'])
 def get_task_log(task_id):
     if not job: return "No job running", 404
-    log_file_path = resolve_vfs(f"fs://job/{job['jobId']}/logs/{task_id}.log")
-    if os.path.exists(log_file_path):
-        with open(log_file_path, 'r', encoding='utf-8') as f: content = f.read()
+    log_bucket, log_key = parse_vfs_path(f"fs://job/{job['jobId']}/logs/{task_id}.log")
+    try:
+        response = s3_client.get_object(Bucket=log_bucket, Key=log_key)
+        content = response['Body'].read().decode('utf-8')
         return content, 200, {'Content-Type': 'text/plain; charset=utf-8'}
-    else: return "Log not found.", 404
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            return "Log not found.", 404
+        return f"Error retrieving log: {e}", 500
 
 @app.route('/api/vfs/upload', methods=['POST'])
 def upload_file():
@@ -377,78 +421,99 @@ def upload_file():
     file = request.files['file']
     if not file or not file.filename:
         return jsonify({"status": "FAIL", "message": "No file selected."}), 400
+    
     filename = secure_filename(file.filename)
-    upload_vfs_path = f'fs://{target_folder}/'
-    upload_folder_real = resolve_vfs(upload_vfs_path)
-    os.makedirs(upload_folder_real, exist_ok=True)
-    file_path = os.path.join(upload_folder_real, filename)
-    file.save(file_path)
-    print(f"[*] User uploaded {filename} to {target_folder}")
-    return jsonify({"status": "OK", "message": f"File '{filename}' uploaded successfully to fs://{target_folder}/."})
+    object_key = f"{target_folder}/{filename}"
+    try:
+        s3_client.upload_fileobj(file, VFS_BUCKET, object_key)
+        print(f"[*] User uploaded {filename} to S3 bucket '{VFS_BUCKET}' with key '{object_key}'")
+        return jsonify({"status": "OK", "message": f"File '{filename}' uploaded successfully to fs://{object_key}."})
+    except Exception as e:
+        return jsonify({"status": "FAIL", "message": f"Upload to S3 failed: {e}"}), 500
 
 @app.route('/api/vfs/download', methods=['GET'])
 def download_file():
     vfs_path = request.args.get('path')
-    if not vfs_path:
-        return "Missing 'path' parameter.", 400
+    if not vfs_path: return "Missing 'path' parameter.", 400
+    
+    bucket, key = parse_vfs_path(vfs_path)
+    # Thêm kiểm tra cho cả key để làm hài lòng Pylance
+    if not bucket or not key: 
+        return "Invalid VFS path.", 400
+        
     try:
-        real_path = resolve_vfs(vfs_path)
-        if not os.path.abspath(real_path).startswith(os.path.abspath(VFS_ROOT)):
-             return "Access denied: Cannot download files outside the VFS root.", 403
-        if os.path.exists(real_path) and os.path.isfile(real_path):
-            directory = os.path.dirname(real_path)
-            filename = os.path.basename(real_path)
-            return send_from_directory(directory, filename, as_attachment=True)
-        else:
-            return "File not found.", 404
-    except Exception as e:
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        def generate():
+            for chunk in response['Body'].iter_chunks(): yield chunk
+        
+        return Response(generate(), mimetype=response['ContentType'], headers={
+            "Content-Disposition": f"attachment;filename={os.path.basename(key)}"
+        })
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey': return "File not found.", 404
         return f"An error occurred: {e}", 500
 
 @app.route('/api/vfs/list', methods=['GET'])
 def list_vfs_path():
     vfs_path_str = request.args.get('path', 'fs://')
-    if not vfs_path_str.startswith('fs://'):
-        return jsonify({"error": "Invalid VFS path"}), 400
+    bucket, prefix = parse_vfs_path(vfs_path_str)
+    if not bucket: return jsonify({"error": "Invalid VFS path"}), 400
+
+    if prefix and not prefix.endswith('/'): prefix += '/'
+    if prefix == '/': prefix = ''
+
     try:
-        real_path = resolve_vfs(vfs_path_str)
-        if not os.path.abspath(real_path).startswith(os.path.abspath(VFS_ROOT)):
-            return jsonify({"error": "Access denied"}), 403
-        if not os.path.exists(real_path) or not os.path.isdir(real_path):
-            return jsonify({"error": "Path not found or is not a directory"}), 404
+        paginator = s3_client.get_paginator('list_objects_v2')
+        pages = paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter='/')
         items = []
-        for name in sorted(os.listdir(real_path)):
-            item_path = os.path.join(real_path, name)
-            is_dir = os.path.isdir(item_path)
-            items.append({"name": name, "type": "directory" if is_dir else "file", "size": os.path.getsize(item_path) if not is_dir else 0})
-        return jsonify({"path": vfs_path_str, "contents": items})
+        for page in pages:
+            for common_prefix in page.get('CommonPrefixes', []):
+                items.append({
+                    "name": os.path.basename(os.path.normpath(common_prefix.get('Prefix'))),
+                    "type": "directory", "size": 0
+                })
+            for obj in page.get('Contents', []):
+                if obj.get('Key') != prefix: # Don't list the directory itself
+                    items.append({
+                        "name": os.path.basename(obj.get('Key')),
+                        "type": "file", "size": obj.get('Size', 0)
+                    })
+        return jsonify({"path": vfs_path_str, "contents": sorted(items, key=lambda x: x['name'])})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/vfs/delete', methods=['POST'])
+@app.route('/api/vfs/delete', methods=['POST'])
 def delete_vfs_path():
     data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"status": "FAIL", "message": "Invalid or missing JSON payload."}), 400
+    if not data: return jsonify({"status": "FAIL", "message": "Invalid or missing JSON payload."}), 400
     vfs_path_str = data.get('path')
-    if not vfs_path_str:
-        return jsonify({"status": "FAIL", "message": "Path is required in JSON payload."}), 400
+    if not vfs_path_str: return jsonify({"status": "FAIL", "message": "Path is required."}), 400
+    
+    bucket, key = parse_vfs_path(vfs_path_str)
+    if not bucket or not key: 
+        return jsonify({"status": "FAIL", "message": "Invalid VFS path."}), 400
+
     try:
-        real_path = resolve_vfs(vfs_path_str)
-        if not os.path.abspath(real_path).startswith(os.path.abspath(VFS_ROOT)):
-            return jsonify({"status": "FAIL", "message": "Access denied."}), 403
-        if not os.path.exists(real_path):
-            return jsonify({"status": "FAIL", "message": "File or directory not found."}), 404
-        if os.path.isdir(real_path):
-            shutil.rmtree(real_path)
-            message = f"Directory '{vfs_path_str}' deleted successfully."
+        if key.endswith('/'):
+            objects_to_delete = []
+            paginator = s3_client.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=bucket, Prefix=key):
+                for obj in page.get('Contents', []):
+                    objects_to_delete.append({'Key': obj['Key']})
+            if objects_to_delete:
+                s3_client.delete_objects(Bucket=bucket, Delete={'Objects': objects_to_delete})
+            message = f"Directory '{vfs_path_str}' and its contents deleted."
         else:
-            os.remove(real_path)
+            s3_client.delete_object(Bucket=bucket, Key=key)
             message = f"File '{vfs_path_str}' deleted successfully."
+
         print(f"[*] Deleted VFS path: {vfs_path_str}")
         return jsonify({"status": "OK", "message": message})
     except Exception as e:
         return jsonify({"status": "FAIL", "message": str(e)}), 500
 
+# ... (các API job/submit, job/kill không đổi) ...
 @app.route('/api/job/submit', methods=['POST'])
 def submit_job_api():
     if JOB_IN_PROGRESS.acquire(blocking=False):
@@ -456,7 +521,6 @@ def submit_job_api():
             dag_payload = request.json
             if not dag_payload or 'jobId' not in dag_payload:
                 JOB_IN_PROGRESS.release(); return jsonify({"status": "FAIL", "message": "Invalid DAG JSON."}), 400
-            # SỬA LỖI: Luôn truyền is_resumed=False (hoặc không truyền gì) cho job mới
             threading.Thread(target=job_controller, args=(dag_payload, False)).start()
             return jsonify({"status": "OK", "message": f"Job '{dag_payload['jobId']}' accepted."})
         except Exception as e:
@@ -470,22 +534,23 @@ def kill_job():
     JOB_CANCEL_EVENT.set(); task_queue.clear()
     return jsonify({"status": "OK", "message": "Kill signal sent."})
 
+
 @app.route('/api/history', methods=['GET'])
 def get_history_list():
-    history_dir = resolve_vfs('fs://history/')
-    if not os.path.exists(history_dir):
-        return jsonify([])
+    bucket, prefix = parse_vfs_path('fs://history/')
     jobs = []
     try:
-        for filename in os.listdir(history_dir):
-            if filename.endswith('.json'):
-                file_path = os.path.join(history_dir, filename)
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
+        paginator = s3_client.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get('Contents', []):
+                filename = os.path.basename(obj['Key'])
+                if filename.endswith('.json'):
+                    try:
+                        response = s3_client.get_object(Bucket=bucket, Key=obj['Key'])
+                        data = json.load(response['Body'])
                         jobs.append({"jobId": data.get("jobId", filename.replace('.json', '')), "status": data.get("finalStatus", "UNKNOWN"), "endTime": data.get("endTime", "N/A"), "filename": filename})
-                except:
-                     jobs.append({"jobId": filename, "status": "ERROR", "endTime": "N/A", "filename": filename})
+                    except Exception:
+                        jobs.append({"jobId": filename, "status": "ERROR", "endTime": "N/A", "filename": filename})
         jobs.sort(key=lambda x: x['endTime'], reverse=True)
         return jsonify(jobs)
     except Exception as e:
@@ -494,17 +559,17 @@ def get_history_list():
 @app.route('/api/history/<job_id>', methods=['GET'])
 def get_history_detail(job_id):
     safe_filename = secure_filename(f"{job_id}.json")
-    history_path = resolve_vfs(f'fs://history/{safe_filename}')
-    if os.path.exists(history_path):
-        try:
-            with open(history_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            return jsonify(data)
-        except Exception as e:
-             return jsonify({"error": f"Failed to read history file: {e}"}), 500
-    else:
-        return jsonify({"error": "Job history not found"}), 404
+    bucket, key = parse_vfs_path(f'fs://history/{safe_filename}')
+    try:
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        data = json.load(response['Body'])
+        return jsonify(data)
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            return jsonify({"error": "Job history not found"}), 404
+        return jsonify({"error": f"Failed to read history file from S3: {e}"}), 500
 
+# --- Server Startup ---
 def run_web_server():
     class ServerThread(threading.Thread):
         def __init__(self, app, host, port):
@@ -518,19 +583,28 @@ def run_web_server():
     server_thread.start()
 
 def resume_crashed_jobs():
-    print("[*] Checking for crashed jobs to resume...")
-    job_dir = resolve_vfs('fs://job/')
-    if not os.path.exists(job_dir):
-        return
+    print("[*] Checking for crashed jobs to resume from S3...")
+    bucket, prefix = parse_vfs_path('fs://job/')
     
-    for job_id in os.listdir(job_dir):
-        checkpoint_path = os.path.join(job_dir, job_id, 'checkpoint.json')
-        if os.path.exists(checkpoint_path):
-            print(f"[!] Found checkpoint for crashed job: {job_id}. Attempting to resume.")
+    try:
+        paginator = s3_client.get_paginator('list_objects_v2')
+        # Tìm các job directories bằng cách list các "thư mục con" trong 'job/'
+        pages = paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter='/')
+        job_prefixes = [p['Prefix'] for page in pages for p in page.get('CommonPrefixes', [])]
+    except Exception as e:
+        print(f"[!] Could not list jobs in S3 to check for resume: {e}")
+        return
+
+    for job_prefix in job_prefixes:
+        checkpoint_key = f"{job_prefix}checkpoint.json"
+        try:
+            # Kiểm tra sự tồn tại của checkpoint.json
+            s3_client.head_object(Bucket=bucket, Key=checkpoint_key)
+            print(f"[!] Found S3 checkpoint for crashed job: {job_prefix}. Attempting to resume.")
             if JOB_IN_PROGRESS.acquire(blocking=False):
                 try:
-                    with open(checkpoint_path, 'r', encoding='utf-8') as f:
-                        checkpoint_data = json.load(f)
+                    response = s3_client.get_object(Bucket=bucket, Key=checkpoint_key)
+                    checkpoint_data = json.load(response['Body'])
                     
                     global job, tasks_state, stage_state, stage_outputs, task_queue, sorted_stages, stage_dependencies
                     job = checkpoint_data['dag_payload']
@@ -544,20 +618,22 @@ def resume_crashed_jobs():
                     for tid, tinfo in list(tasks_state.items()):
                         if tinfo.get('status') in ['ASSIGNED', 'RUNNING']:
                             print(f"[*] Re-queueing task {tid} from resumed job.")
-                            tinfo['status'] = 'PENDING'
-                            tinfo['workerId'] = None
+                            tinfo['status'] = 'PENDING'; tinfo['workerId'] = None
                             task_queue.appendleft({'taskId': tid, 'stageId': tinfo['stageId'], 'cmd': tinfo['cmd']})
 
-                    print(f"[*] Resuming job controller for '{job_id}'...")
-                    # SỬA LỖI: Truyền is_resumed=True
+                    print(f"[*] Resuming job controller for '{job['jobId']}'...")
                     threading.Thread(target=job_controller, args=(job, True)).start()
-                    return
+                    return # Chỉ resume một job mỗi lần khởi động
                 except Exception as e:
-                    print(f"[!!!] CRITICAL: Failed to resume job from checkpoint {checkpoint_path}: {e}")
+                    print(f"[!!!] CRITICAL: Failed to resume job from S3 checkpoint {checkpoint_key}: {e}")
                     if JOB_IN_PROGRESS.locked(): JOB_IN_PROGRESS.release()
             else:
                 print("[!] Server is already busy. Cannot resume job at this time.")
                 break
+        except ClientError as e:
+            if e.response['Error']['Code'] != '404':
+                print(f"[!] Error checking checkpoint {checkpoint_key}: {e}")
+            continue # Bỏ qua nếu không có checkpoint
 
 def main():
     threading.Thread(target=run_web_server, daemon=True).start()
