@@ -35,7 +35,7 @@
       "type": "single",
       "deps": ["wc-reduce"],
       "tasksSpec": {
-        "cmd": "python fs://scripts/summarize.py --in_dir \"fs://job/wordcount-demo-001/wc-reduce/\" --out \"fs://job/FINAL_wordcount_result.txt\""
+        "cmd": "python summarize.py --in_dir \"fs://job/wordcount-demo-001/wc-reduce/\" --out \"fs://job/FINAL_wordcount_result.txt\""
       }
     }
   ]
