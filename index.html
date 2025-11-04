@@ -29,10 +29,10 @@
         .card { background-color: var(--card-color); padding: 20px; border-radius: 12px; border: 1px solid var(--border-color); }
         .card-header { display: flex; align-items: center; gap: 10px; font-size: 1.2rem; font-weight: 600; margin-bottom: 16px; border-bottom: 1px solid var(--border-color); padding-bottom: 12px; }
         .status { padding: 4px 10px; border-radius: 20px; font-weight: 500; font-size: 0.8rem; text-align: center; text-transform: uppercase; }
-        .status-succeeded { background-color: rgba(40, 167, 69, 0.2); color: #52c41a; }
+        .status-succeeded, .status-completed { background-color: rgba(40, 167, 69, 0.2); color: #52c41a; }
         .status-running, .status-assigned { background-color: rgba(13, 110, 253, 0.2); color: #1677ff; }
         .status-pending { background-color: rgba(108, 117, 125, 0.2); color: #8c8c8c; }
-        .status-failed { background-color: rgba(220, 53, 69, 0.2); color: #f5222d; }
+        .status-failed, .status-error { background-color: rgba(220, 53, 69, 0.2); color: #f5222d; }
         .status-cancelled { background-color: rgba(255, 193, 7, 0.2); color: #faad14; }
         ul { list-style: none; padding: 0; } 
         li { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--border-color); transition: background-color 0.2s; }
@@ -46,7 +46,7 @@
         .btn { padding: 10px 15px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; display: flex; align-items: center; justify-content: center; gap: 8px; }
         .btn-primary { background-color: var(--blue); color: white; } .btn-danger { background-color: var(--red); color: white; }
         
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px; margin-bottom: 24px; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px; }
         .stat-card { background-color: var(--card-color); padding: 20px; border-radius: 12px; border: 1px solid var(--border-color); }
         .stat-card-title { font-size: 0.9rem; color: var(--text-muted-color); margin-bottom: 8px; }
         .stat-card-value { font-size: 2rem; font-weight: 700; }
@@ -152,12 +152,30 @@
                 <ul id="workers-list"></ul>
             </div>
             <div class="card">
+                <div class="card-header">
+                    <i class="fas fa-history"></i> Job History
+                    <button id="refresh-history-btn" style="margin-left: auto; background: none; border: none; color: var(--text-muted-color); cursor: pointer;">
+                        <i class="fas fa-sync-alt"></i>
+                    </button>
+                </div>
+                <ul id="history-list" style="max-height: 200px; overflow-y: auto;">
+                    <li style="color: var(--text-muted-color); font-style: italic;">No history yet.</li>
+                </ul>
+            </div>
+            <div class="card">
                 <div class="card-header"><i class="fas fa-project-diagram"></i>Stages</div>
                 <ul id="stages-list"></ul>
             </div>
         </div>
         <div class="main-content">
+            <!-- SỬA LỖI: Cấu trúc lại khu vực này -->
             <div id="job-status-container">
+                <button id="return-to-live-btn" class="btn btn-primary" style="display: none; margin-bottom: 15px;">
+                    <i class="fas fa-satellite-dish"></i> Return to Live View
+                </button>
+                <div id="stats-cards-wrapper">
+                    <!-- Nội dung thống kê sẽ được render vào đây -->
+                </div>
             </div>
             <div class="card">
                 <div class="card-header"><i class="fas fa-tasks"></i>Tasks</div>
@@ -213,6 +231,7 @@
             currentVfsPathEl = document.getElementById('current-vfs-path');
 
         let currentVfsPath = 'fs://';
+        let liveUpdateInterval = null;
 
         closeBtn.onclick = () => { modal.style.display = "none"; }
         closeFileManagerBtn.onclick = () => { fileManagerModal.style.display = "none"; }
@@ -314,47 +333,121 @@
             }
         }
 
-        function renderStats(jobData) {
-            const container = document.getElementById('job-status-container');
-            if (jobData.status === "No job running") {
-                container.innerHTML = `<div class="card"><p>No job is currently running. Use the Control Panel to submit one.</p></div>`;
-                return;
+        async function loadHistoryList() {
+            const historyListEl = document.getElementById('history-list');
+            try {
+                const res = await fetch(`${API_BASE}/history`);
+                if (!res.ok) throw new Error("Failed to fetch history");
+                const jobs = await res.json();
+
+                if (jobs.length === 0) {
+                    historyListEl.innerHTML = '<li style="color: var(--text-muted-color); font-style: italic;">No history yet.</li>';
+                    return;
+                }
+
+                historyListEl.innerHTML = '';
+                jobs.forEach(job => {
+                    let statusClass = 'status-' + (job.status || 'unknown').toLowerCase();
+                    historyListEl.innerHTML += `
+                        <li class="clickable" onclick="loadHistoryDetail('${job.jobId}')">
+                            <div>
+                                <span style="font-weight: 500;">${job.jobId}</span>
+                                <br>
+                                <span style="font-size: 0.8rem; color: var(--text-muted-color);">${job.endTime}</span>
+                            </div>
+                            <span class="status ${statusClass}" style="font-size: 0.7rem;">
+                                ${job.status}
+                            </span>
+                        </li>
+                    `;
+                });
+            } catch (e) {
+                console.error("Error loading history:", e);
+                historyListEl.innerHTML = '<li style="color: var(--red);">Failed to load history.</li>';
             }
+        }
 
-            const tasks = Object.values(jobData.tasks_state || {});
-            const succeeded = tasks.filter(t => t.status === 'SUCCEEDED').length;
-            const running = tasks.filter(t => t.status === 'RUNNING' || t.status === 'ASSIGNED').length;
-            const failed = tasks.filter(t => t.status === 'FAILED').length;
-            const totalTasks = tasks.length;
-            const progress = totalTasks > 0 ? (succeeded / totalTasks) * 100 : 0;
+        async function loadHistoryDetail(jobId) {
+            if (liveUpdateInterval) clearInterval(liveUpdateInterval);
+            document.getElementById('return-to-live-btn').style.display = 'flex';
+            
+            // SỬA LỖI: Chỉ cập nhật wrapper, không phải toàn bộ container
+            const statsWrapper = document.getElementById('stats-cards-wrapper');
+            statsWrapper.innerHTML = '<div class="card"><p>Loading history for ' + jobId + '...</p></div>';
 
-            container.innerHTML = `
-                <div class="stats-grid">
-                    <div class="stat-card" id="stat-job-id">
-                        <div class="stat-card-title">CURRENT JOB ID</div>
-                        <div class="stat-card-value">${jobData.jobId}</div>
-                        <div style="width: 100%; background-color: #444; border-radius: 5px; height: 10px; margin-top: 10px;">
-                            <div style="height: 100%; background-color: var(--green); width: ${progress.toFixed(1)}%; border-radius: 5px;"></div>
+            document.getElementById('stages-list').innerHTML = '<li>Loading...</li>';
+            document.getElementById('tasks-table-body').innerHTML = '<tr><td colspan="6" style="text-align:center;">Loading...</td></tr>';
+            document.getElementById('workers-list').innerHTML = '<li>N/A in history view</li>';
+
+            try {
+                const res = await fetch(`${API_BASE}/history/${jobId}`);
+                if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+                
+                const historyData = await res.json();
+                
+                const mockJobData = {
+                    status: historyData.finalStatus,
+                    jobId: historyData.jobId,
+                    tasks_state: historyData.tasks_state,
+                    sorted_stages: historyData.sorted_stages,
+                    stage_state: historyData.stage_state,
+                    task_queue_size: 0
+                };
+
+                renderStats(mockJobData);
+                renderStages(mockJobData);
+                uiState.tasks = Object.entries(mockJobData.tasks_state || {}).map(([id, t]) => ({ taskId: id, ...t }));
+                renderTasks();
+
+            } catch (e) {
+                statsWrapper.innerHTML = `<div class="card"><p style="color: var(--red);">Failed to load history: ${e.message}</p></div>`;
+            }
+        }
+
+        function renderStats(jobData) {
+            // SỬA LỖI: Target div mới thay vì container cũ
+            const container = document.getElementById('stats-cards-wrapper');
+            let content = '';
+
+            if (jobData.status === "No job running") {
+                content = `<div class="card"><p>No job is currently running. Use the Control Panel to submit one.</p></div>`;
+            } else {
+                const tasks = Object.values(jobData.tasks_state || {});
+                const succeeded = tasks.filter(t => t.status === 'SUCCEEDED').length;
+                const running = tasks.filter(t => t.status === 'RUNNING' || t.status === 'ASSIGNED').length;
+                const failed = tasks.filter(t => t.status === 'FAILED').length;
+                const totalTasks = tasks.length;
+                const progress = totalTasks > 0 ? (succeeded / totalTasks) * 100 : 0;
+                
+                content = `
+                    <div class="stats-grid">
+                        <div class="stat-card" id="stat-job-id">
+                            <div class="stat-card-title">JOB ID</div>
+                            <div class="stat-card-value">${jobData.jobId}</div>
+                            <div style="width: 100%; background-color: #444; border-radius: 5px; height: 10px; margin-top: 10px;">
+                                <div style="height: 100%; background-color: var(--green); width: ${progress.toFixed(1)}%; border-radius: 5px;"></div>
+                            </div>
+                        </div>
+                        <div class="stat-card" id="stat-succeeded">
+                            <div class="stat-card-title">SUCCEEDED</div>
+                            <div class="stat-card-value">${succeeded}</div>
+                        </div>
+                        <div class="stat-card" id="stat-running">
+                            <div class="stat-card-title">RUNNING</div>
+                            <div class="stat-card-value">${running}</div>
+                        </div>
+                        <div class="stat-card" id="stat-failed">
+                            <div class="stat-card-title">FAILED</div>
+                            <div class="stat-card-value">${failed}</div>
+                        </div>
+                        <div class="stat-card" id="stat-pending">
+                            <div class="stat-card-title">IN QUEUE</div>
+                            <div class="stat-card-value">${jobData.task_queue_size}</div>
                         </div>
                     </div>
-                    <div class="stat-card" id="stat-succeeded">
-                        <div class="stat-card-title">SUCCEEDED</div>
-                        <div class="stat-card-value">${succeeded}</div>
-                    </div>
-                    <div class="stat-card" id="stat-running">
-                        <div class="stat-card-title">RUNNING</div>
-                        <div class="stat-card-value">${running}</div>
-                    </div>
-                    <div class="stat-card" id="stat-failed">
-                        <div class="stat-card-title">FAILED</div>
-                        <div class="stat-card-value">${failed}</div>
-                    </div>
-                    <div class="stat-card" id="stat-pending">
-                        <div class="stat-card-title">IN QUEUE</div>
-                        <div class="stat-card-value">${jobData.task_queue_size}</div>
-                    </div>
-                </div>
-            `;
+                `;
+            }
+            container.innerHTML = content;
         }
         
         function renderWorkers(workersData) {
@@ -377,11 +470,9 @@
             if (uiState.activeStageFilter) {
                 filteredTasks = filteredTasks.filter(t => t.stageId === uiState.activeStageFilter);
             }
-
             if (uiState.taskStatusFilter !== 'all') {
                 filteredTasks = filteredTasks.filter(t => t.status === uiState.taskStatusFilter);
             }
-
             filteredTasks.sort((a, b) => {
                 const valA = a[uiState.taskSort.key] || '';
                 const valB = b[uiState.taskSort.key] || '';
@@ -422,7 +513,7 @@
         
         function filterByStage(stageId) {
             uiState.activeStageFilter = uiState.activeStageFilter === stageId ? null : stageId;
-            updateDashboard(true);
+            renderTasks();
         }
 
         async function updateDashboard(renderOnly = false) {
@@ -469,30 +560,28 @@
         }
 
         // --- Event Listeners ---
-        document.getElementById('manage-files-btn').onclick = () => {
-            openFileManager();
+        document.getElementById('return-to-live-btn').onclick = () => {
+            startLiveUpdates();
         };
-
+        document.getElementById('refresh-history-btn').onclick = (e) => {
+            const icon = e.currentTarget.querySelector('i');
+            icon.classList.add('fa-spin');
+            loadHistoryList().finally(() => {
+                setTimeout(() => icon.classList.remove('fa-spin'), 500);
+            });
+        };
+        document.getElementById('manage-files-btn').onclick = () => { openFileManager(); };
         document.getElementById('upload-btn').onclick = async () => {
             const fileInput = document.getElementById('file-upload');
             const targetSelect = document.getElementById('upload-target');
             const file = fileInput.files[0];
             const target = targetSelect.value;
-
-            if (!file) {
-                showToast('Please select a file to upload.', 'error');
-                return;
-            }
-
+            if (!file) { showToast('Please select a file to upload.', 'error'); return; }
             const formData = new FormData();
             formData.append('file', file);
             formData.append('target', target);
-
             try {
-                const res = await fetch(`${API_BASE}/vfs/upload`, {
-                    method: 'POST',
-                    body: formData
-                });
+                const res = await fetch(`${API_BASE}/vfs/upload`, { method: 'POST', body: formData });
                 const data = await res.json();
                 showToast(data.message, res.ok ? 'success' : 'error');
                 fileInput.value = '';
@@ -500,16 +589,10 @@
                 showToast('An error occurred during upload.', 'error');
             }
         };
-
         document.getElementById('download-btn').onclick = () => {
-            const filePath = prompt("Please enter the full VFS path of the file to download (you can get this from the File Manager):", "fs://job/wordcount-demo-001/summarize/FINAL_wordcount_result.txt");
-
-            if (filePath) {
-                const downloadUrl = `${API_BASE}/vfs/download?path=${encodeURIComponent(filePath)}`;
-                window.open(downloadUrl, '_blank');
-            }
+            const filePath = prompt("Please enter the full VFS path of the file to download (you can get this from the File Manager):", "fs://job/wordcount-demo-001/FINAL_wordcount_result.txt");
+            if (filePath) { window.open(`${API_BASE}/vfs/download?path=${encodeURIComponent(filePath)}`, '_blank'); }
         };
-
         document.getElementById('submit-job-btn').onclick = async () => {
             const dagText = document.getElementById('dag-input').value;
             if (!dagText) { showToast('DAG JSON cannot be empty.', 'error'); return; }
@@ -517,12 +600,17 @@
                 const dagJson = JSON.parse(dagText);
                 const res = await fetch(`${API_BASE}/job/submit`, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(dagJson) });
                 const data = await res.json();
-                showToast(data.message, res.ok ? 'success' : 'error');
+                if (res.ok) {
+                    showToast(data.message, 'success');
+                    // Tự động refresh list history sau vài giây để job mới hiện ra
+                    setTimeout(loadHistoryList, 5000); 
+                } else {
+                    showToast(data.message, 'error');
+                }
             } catch (e) {
                 showToast('Error: Invalid JSON format.', 'error');
             }
         };
-
         document.getElementById('kill-job-btn').onclick = async () => {
             if (confirm('Are you sure you want to kill the current job?')) {
                 const res = await fetch(`${API_BASE}/job/kill`, { method: 'POST' });
@@ -530,12 +618,10 @@
                 showToast(data.message, 'success');
             }
         };
-        
         document.getElementById('status-filter').addEventListener('change', (e) => {
             uiState.taskStatusFilter = e.target.value;
             renderTasks();
         });
-
         document.querySelectorAll('th[data-sort]').forEach(th => {
             th.addEventListener('click', () => {
                 const key = th.getAttribute('data-sort');
@@ -552,8 +638,15 @@
             });
         });
 
-        updateDashboard();
-        setInterval(updateDashboard, 2500);
+        function startLiveUpdates() {
+            if (liveUpdateInterval) clearInterval(liveUpdateInterval);
+            document.getElementById('return-to-live-btn').style.display = 'none';
+            updateDashboard();
+            liveUpdateInterval = setInterval(updateDashboard, 2500);
+        }
+
+        loadHistoryList();
+        startLiveUpdates();
     </script>
 </body>
 </html>
