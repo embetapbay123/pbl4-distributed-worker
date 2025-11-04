@@ -6,7 +6,7 @@
       "type": "bot",
       "deps": [],
       "tasksSpec": {
-        "cmd_template": "python fs://scripts/line_reverser.py --in \"{input}\" --out \"{output}\"",
+        "cmd_template": "python line_reverser.py --in \"{input}\" --out \"{output}\"",
         "inputs": [
           "fs://raw/proverb1.txt",
           "fs://raw/proverb2.txt"
@@ -19,7 +19,7 @@
       "type": "single",
       "deps": ["reverse-lines"],
       "tasksSpec": {
-        "cmd": "python fs://scripts/merge_files.py --in_dir \"fs://job/bot-demo-001/reversed/\" --out \"fs://job/FINAL_reversed_result.txt\""
+        "cmd": "python merge_files.py --in_dir \"fs://job/bot-demo-001/reversed/\" --out \"fs://job/FINAL_reversed_result.txt\""
       }
     }
   ]

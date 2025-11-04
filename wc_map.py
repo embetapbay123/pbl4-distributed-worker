@@ -5,83 +5,60 @@ import json
 import re
 from collections import defaultdict
 import os
-import boto3
-from botocore.client import Config
 
-# --- MinIO/S3 Configuration Block (Thêm vào mỗi script) ---
-MINIO_ENDPOINT = os.getenv('MINIO_ENDPOINT', '127.0.0.1:9000')
-MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
-MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
-VFS_BUCKET = 'pbl4-vfs'
-
-s3_client = boto3.client(
-    's3',
-    endpoint_url=f'http://{MINIO_ENDPOINT}',
-    aws_access_key_id=MINIO_ACCESS_KEY,
-    aws_secret_access_key=MINIO_SECRET_KEY,
-    config=Config(signature_version='s3v4')
-)
-
-def parse_vfs_path(path):
-    """Phân tích 'fs://' path thành (bucket, key)."""
-    if not path.startswith('fs://'):
-        raise ValueError(f"Invalid VFS path: {path}")
-    return VFS_BUCKET, path[5:]
-
-def iter_range_lines_s3(bucket, key, start, end):
-    """Đọc các dòng trong một khoảng byte từ S3, căn chỉnh theo dòng."""
-    # Lấy một chunk lớn hơn một chút để xử lý dòng bị cắt ở đầu
-    range_header = f"bytes={start}-{end}"
-    
-    response = s3_client.get_object(Bucket=bucket, Key=key, Range=range_header)
-    body = response['Body']
-    
-    # Nếu start > 0, chúng ta có thể đang ở giữa một dòng.
-    # Đọc và bỏ qua dòng đó để tránh xử lý một phần.
-    # Logic này cần được kiểm tra kỹ vì S3 stream không hỗ trợ seek.
-    # Cách tiếp cận đơn giản hơn là chỉ xử lý các dòng hoàn chỉnh trong range.
-    # Đoạn code dưới đây giả định các dòng không quá lớn.
-    content = body.read().decode('utf-8', errors='ignore')
-    lines = content.splitlines()
-
-    # Nếu bắt đầu từ 0, dòng đầu tiên luôn hợp lệ.
-    # Nếu không, dòng đầu tiên có thể không hoàn chỉnh, nên bỏ qua.
-    start_index = 0 if start == 0 else 1
-    
-    for line in lines[start_index:]:
-        yield line
+def iter_range_lines(path, start, end):
+    """Đọc các dòng trong một khoảng byte, căn chỉnh theo dòng."""
+    with open(path, 'rb') as f:
+        f.seek(start)
+        # Nếu start > 0, chúng ta có thể đang ở giữa một dòng.
+        # Đọc và bỏ qua dòng đó để tránh xử lý một phần.
+        if start > 0:
+            f.readline()
+        
+        while f.tell() <= end:
+            line = f.readline()
+            if not line:
+                break
+            # Chỉ xử lý dòng nếu nó bắt đầu trong khoảng [start, end]
+            if f.tell() - len(line) > end:
+                break
+            yield line.decode('utf-8', errors='ignore')
 
 def main():
     parser = argparse.ArgumentParser(description="Map function for WordCount")
-    parser.add_argument('--uri', required=True, help="Input file VFS URI")
+    parser.add_argument('--uri', required=True, help="Input file URI")
     parser.add_argument('--start', type=int, default=0, help="Start byte")
     parser.add_argument('--end', type=int, required=True, help="End byte")
     parser.add_argument('--task_id', required=True, help="Task ID for output naming")
-    parser.add_argument('--out_dir', required=True, help="Output directory VFS path")
+    parser.add_argument('--out_dir', required=True, help="Output directory for intermediate files")
     parser.add_argument('--num_reducers', type=int, required=True, help="Number of reducers")
     args = parser.parse_args()
 
-    bucket, key = parse_vfs_path(args.uri)
+    # Tạo thư mục output nếu chưa tồn tại
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    # Dùng dict để nhóm các từ cho mỗi reducer
+    # intermediate_data[reducer_index] = {word: count}
     intermediate_data = [defaultdict(int) for _ in range(args.num_reducers)]
 
-    for line in iter_range_lines_s3(bucket, key, args.start, args.end):
+    # Xử lý từng dòng trong khoảng byte được giao
+    for line in iter_range_lines(args.uri, args.start, args.end):
         words = re.findall(r'\w+', line.lower())
         for word in words:
+            # Phân phối từ cho reducer dựa trên hash
             reducer_index = hash(word) % args.num_reducers
             intermediate_data[reducer_index][word] += 1
     
     output_files = []
-    out_bucket, out_prefix = parse_vfs_path(args.out_dir)
-    
+    # Ghi kết quả trung gian ra các file JSON
     for i in range(args.num_reducers):
-        if intermediate_data[i]:
-            output_key = f"{out_prefix.strip('/')}/{args.task_id}-part-{i}.json"
-            output_content = json.dumps(dict(intermediate_data[i])).encode('utf-8')
+        if intermediate_data[i]: # Chỉ ghi nếu có dữ liệu
+            output_path = os.path.join(args.out_dir, f"{args.task_id}-part-{i}.json")
+            with open(output_path, 'w') as f:
+                json.dump(dict(intermediate_data[i]), f)
+            output_files.append(output_path)
             
-            s3_client.put_object(Bucket=out_bucket, Key=output_key, Body=output_content)
-            
-            output_files.append(f"fs://{output_key}")
-            
+    # In ra stdout danh sách các file đã tạo, server sẽ đọc output này
     print(json.dumps(output_files))
 
 if __name__ == "__main__":

@@ -3,65 +3,36 @@ import sys
 import argparse
 import json
 from collections import defaultdict
-import os
-import boto3
-from botocore.client import Config
-from botocore.exceptions import ClientError
-
-# --- MinIO/S3 Configuration Block ---
-MINIO_ENDPOINT = os.getenv('MINIO_ENDPOINT', '127.0.0.1:9000')
-MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
-MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
-VFS_BUCKET = 'pbl4-vfs'
-
-s3_client = boto3.client(
-    's3',
-    endpoint_url=f'http://{MINIO_ENDPOINT}',
-    aws_access_key_id=MINIO_ACCESS_KEY,
-    aws_secret_access_key=MINIO_SECRET_KEY,
-    config=Config(signature_version='s3v4')
-)
-
-def parse_vfs_path(path):
-    if not path.startswith('fs://'):
-        raise ValueError(f"Invalid VFS path: {path}")
-    return VFS_BUCKET, path[5:]
 
 def main():
     parser = argparse.ArgumentParser(description="Reduce function for WordCount")
-    parser.add_argument('--inputs', required=True, help="Comma-separated list of input VFS paths")
-    parser.add_argument('--out', required=True, help="Final output VFS path")
+    parser.add_argument('--inputs', required=True, help="Comma-separated list of input files")
+    parser.add_argument('--out', required=True, help="Final output file path")
     args = parser.parse_args()
 
     final_counts = defaultdict(int)
-    input_vfs_paths = args.inputs.split(',')
+    input_files = args.inputs.split(',')
 
-    for vfs_path in input_vfs_paths:
+    # Đọc tất cả các file trung gian được gán cho reducer này
+    for file_path in input_files:
         try:
-            bucket, key = parse_vfs_path(vfs_path)
-            response = s3_client.get_object(Bucket=bucket, Key=key)
-            data = json.load(response['Body'])
-            for word, count in data.items():
-                final_counts[word] += count
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'NoSuchKey':
-                print(f"Warning: Input file not found, skipping: {vfs_path}", file=sys.stderr)
-                continue
-            raise e
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+                for word, count in data.items():
+                    final_counts[word] += count
+        except FileNotFoundError:
+            # Bỏ qua nếu file không tồn tại (có thể do mapper không tạo ra output cho partition này)
+            continue
     
+    # Sắp xếp kết quả theo số lần xuất hiện
     sorted_counts = sorted(final_counts.items(), key=lambda item: item[1], reverse=True)
 
-    output_content = ""
-    for word, count in sorted_counts:
-        output_content += f"{word}: {count}\n"
-        
-    out_bucket, out_key = parse_vfs_path(args.out)
-    s3_client.put_object(
-        Bucket=out_bucket, 
-        Key=out_key, 
-        Body=output_content.encode('utf-8')
-    )
+    # Ghi kết quả cuối cùng
+    with open(args.out, 'w') as f:
+        for word, count in sorted_counts:
+            f.write(f"{word}: {count}\n")
             
+    # In ra stdout đường dẫn file output, server sẽ đọc để xác nhận
     print(json.dumps([args.out]))
 
 if __name__ == "__main__":
